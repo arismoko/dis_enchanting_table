@@ -1,759 +1,654 @@
-//! The table's glue: the block entity Part, the click and menu Parts, the
-//! declarations, the deferred experience charge and the `/disenchanting_table
-//! info` readout.
+//! The table in the game: its block entity's tick, its menu's rules, what taking a result does,
+//! the screen, the item drawn on top and the particles.
 //!
-//! Every rule lives in [`crate::runtime`] (the retired bundle's `runtime.rs`,
-//! byte-identical); this file reads the game, calls it and writes the result
-//! back. Its tests pin what it *declares* (three slots and the menu, the panel
-//! geometry), which component an item's enchantments live in, the exact patches
-//! a strip and an output book carry, and the readout's field formatting.
-use std::sync::{Arc, Mutex, PoisonError};
+//! Upstream gives each player in manual mode a menu of their own (`ItemCombinerMenu`) and keeps the
+//! block entity's three slots for automatic mode. Here both modes use the block entity's slots: in
+//! manual mode slot 2 holds a preview of the result (nbt `Preview` says so), the table opens for one
+//! player at a time, and closing it gives the inputs back.
 
+use crate::runtime::{self, Level, Plan, ServerSettings};
+use crate::{client_settings, keys, server_settings};
 use mod_api::{
-    BlockClick, BlockEntityEvent, BlockEntityPart, BlockEntityRef, BlockEntityTypeKey, BlockPart,
-    ClientHost, CommandArgumentValue, ComponentId, Compound, Host, HostTransaction, Identifier,
-    InteractionResult, ItemResource, ItemStack, LevelRef, LevelSide, MenuPart, MenuSlotRulesEvent,
-    ModContainer, PlayerRef, Registrar, Screen, ScreenDrawEvent, ScreenEvent, ServerHost, Tag,
-    Text, UseItemOnEvent, UseWithoutItemEvent,
+    AnimateTickEvent, BlockEntityPart, BlockEntitySubmitEvent, BlockEntityTickEvent,
+    BlockEntityTicksEvent, BlockEntityUpdateTagEvent, BlockPart, CanPlaceItemEvent, ClientHost,
+    Component, Compound, DrawContext, Host, HostBlockStates, HostTransaction, ItemDisplayContext,
+    ItemStack, JavaString, LevelRef, MenuContainer, MenuPart, MenuScreen, MenuScreenFactory,
+    MenuScreenFrame, MenuScreenLayout, MenuScreenOpen, MenuSlotRulesEvent, MenuSlotTakeEvent,
+    ParticleOptions, PlayerRef, PreRemoveSideEffectsEvent, ScreenSlot, ServerHost, Tag,
 };
 
-use crate::runtime::{
-    BOOK_SLOT, Charge, DEFAULT_SETTINGS, ENCHANTED_BOOK_ITEM, INPUT_SLOT, OUTPUT_SLOT, Plan,
-    SLOT_COUNT, TABLE_MENU, affordable_with, charge, is_book, plan as plan_take, slot_rule,
-    total_points,
-};
+/// The table's menu type, its block entity type and its block: one id.
+pub(crate) const ID: &str = "disenchanting_table:disenchanting_table";
+const INPUT: u32 = 0;
+const BOOK: u32 = 1;
+const OUTPUT: u32 = 2;
+/// Data slot 1: [`ServerSettings::cost_rule`]. Data slot 0 holds automatic mode's progress.
+const RULE_SLOT: u32 = 1;
+/// Level event 1503: the end portal frame's fill, smoke and sound.
+const DISENCHANT_EVENT: i32 = 1503;
 
-/// The block entity type's path, in this mod's namespace.
-pub(crate) const TABLE_TYPE: &str = "disenchanting_table";
+/// nbt: the manual preview sits in slot 2 (byte 1), or a real item or nothing does.
+const PREVIEW: &str = "Preview";
+/// nbt: automatic mode's progress, saved as upstream saves it.
+const PROGRESS: &str = "Progress";
+/// nbt, sent to clients: whether the table runs in automatic mode.
+const AUTOMATIC: &str = "Automatic";
+/// nbt, sent to clients: the item drawn on top in automatic mode.
+const SHOWN: &str = "Shown";
 
-/// `minecraft:enchantments`: an item's applied enchantments.
-const KEY_ENCHANTMENTS: &str = "minecraft:enchantments";
-/// `minecraft:stored_enchantments`: an enchanted book's own ones.
-const KEY_STORED_ENCHANTMENTS: &str = "minecraft:stored_enchantments";
-/// `minecraft:repair_cost`: the anvil's prior-work penalty (`resets_repair_cost`).
-const KEY_REPAIR_COST: &str = "minecraft:repair_cost";
+// ---- enchantments ---------------------------------------------------------------------------
 
-/// The fields the readout prints for one block: the three slots, the cost, the
-/// player's experience and whether a click would dis-enchant.
-pub(crate) struct TableSlots {
-    input: Option<ItemStack>,
-    book: Option<ItemStack>,
-    output: Option<ItemStack>,
-}
+/// A component read and written as its raw tag.
+struct Raw(&'static str);
 
-// ---------------------------------------------------------------------------
-// Declarations
-// ---------------------------------------------------------------------------
+impl Component for Raw {
+    type Value = Tag;
 
-/// The block entity type declared for the table, built in `Hooks::register`.
-pub(crate) fn declare(registrar: &mut dyn Registrar) -> BlockEntityTypeKey {
-    registrar
-        .block_entity_type(TABLE_TYPE)
-        .blocks(&[TABLE_TYPE])
-        .build()
-}
+    fn id(&self) -> &str {
+        self.0
+    }
 
-/// The table's container: three slots every face reaches — input 0, book 1,
-/// output 2 — with the input and book filling and the input and output
-/// emptying, and the table's menu. Upstream's `DisEnchantingStrategy
-/// .canOutputToHopper` lets a hopper put an input and a book in and take a
-/// dis-enchanted item out.
-pub(crate) fn container() -> ModContainer {
-    let all = [INPUT_SLOT, BOOK_SLOT, OUTPUT_SLOT];
-    ModContainer {
-        slots: SLOT_COUNT,
-        faces: std::array::from_fn(|_| all.to_vec()),
-        inputs: vec![INPUT_SLOT, BOOK_SLOT],
-        outputs: vec![INPUT_SLOT, OUTPUT_SLOT],
-        menu: Some(TABLE_MENU.to_owned()),
+    fn decode(&self, value: &Tag) -> Option<Tag> {
+        Some(value.clone())
+    }
+
+    fn encode(&self, value: Tag) -> Tag {
+        value
     }
 }
 
-/// The table's menu (`native_screen`, API 19 at the retired pin):
-/// `DisEnchantingMenu`'s 27 / 76 / 134 at y 47, in a 176 × 166 screen.
-///
-/// The jar's GUI texture is carried but not drawn: Horizon's plain panel and
-/// slot frames are used (a gap, see `notes.md`).
-pub(crate) fn menu() -> Screen {
-    Screen {
-        width: 176.0,
-        height: 166.0,
-        slots: vec![Some([27.0, 47.0]), Some([76.0, 47.0]), Some([134.0, 47.0])],
-        inventory_y: 84.0,
-        inventory_x: 8.0,
-        own_labels: false,
-        own_background: false,
-        ..Screen::default()
-    }
-}
+const ENCHANTMENTS: Raw = Raw("minecraft:enchantments");
+const STORED_ENCHANTMENTS: Raw = Raw("minecraft:stored_enchantments");
+const REPAIR_COST: Raw = Raw("minecraft:repair_cost");
 
-// ---------------------------------------------------------------------------
-// Enchantments: reading a stack, writing a component
-// ---------------------------------------------------------------------------
-
-/// The component an item's enchantments live in: `crafting_enchantments` keeps
-/// a book's own ones in `stored_enchantments` and every other item's applied
-/// ones in `enchantments`.
-fn enchantment_component(item: &str) -> &'static str {
-    if crate::runtime::is_enchanted_book(item) {
-        KEY_STORED_ENCHANTMENTS
+/// `EnchantmentHelper.getEnchantmentsForCrafting`: an enchanted book's stored enchantments, any
+/// other item's own, as the stack's patch holds them. No vanilla item has enchantments by default,
+/// so the patch is the whole answer, and no host is needed (a hopper's ask has none).
+fn enchantments(stack: &ItemStack) -> Vec<Level> {
+    let component = if stack.item() == keys().enchanted_book {
+        STORED_ENCHANTMENTS
     } else {
-        KEY_ENCHANTMENTS
+        ENCHANTMENTS
+    };
+    let Some(Tag::Compound(mut levels)) = stack.get(&component) else {
+        return Vec::new();
+    };
+    // The form before 1.21.5 wraps them in `levels`.
+    if let Some(Tag::Compound(inner)) = levels.get(&JavaString::from("levels")) {
+        levels = inner.clone();
     }
-}
-
-/// A stack's enchantments as `(id, level)`, namespaced, in the engine's own
-/// order. Reads the item's effective component (its own, else the item's
-/// default) and accepts the pre-1.21.5 `{levels: {…}}` wrapper the engine still
-/// reads, so an item carried from an older world dis-enchants too.
-fn levels_of(host: &dyn Host, stack: &ItemStack) -> Vec<(String, u32)> {
-    let item = stack.item().id(host);
-    let Some(component) = ComponentId::new(enchantment_component(&item)) else {
-        return Vec::new();
-    };
-    let Some(Tag::Compound(map)) = ItemResource::of(stack).value(host, &component) else {
-        return Vec::new();
-    };
-    let wrapped = map.iter().find_map(|(key, value)| match value {
-        Tag::Compound(inner) if key.to_string_lossy() == "levels" => Some(inner),
-        _ => None,
-    });
-    wrapped
-        .unwrap_or(&map)
+    levels
         .iter()
-        .filter_map(|(key, value)| {
-            let Tag::Int(level) = value else {
-                return None;
+        .filter_map(|(id, level)| {
+            let level = match level {
+                Tag::Byte(n) => i32::from(*n),
+                Tag::Short(n) => i32::from(*n),
+                Tag::Int(n) => *n,
+                _ => return None,
             };
-            if !(1..=255).contains(level) {
-                return None;
-            }
-            let id = key.to_string_lossy();
+            let level = u32::try_from(level)
+                .ok()
+                .filter(|l| (1..=255).contains(l))?;
+            let id = id.to_string_lossy();
             let id = if id.contains(':') {
                 id
             } else {
                 format!("minecraft:{id}")
             };
-            Some((id, u32::try_from(*level).ok()?))
+            Some((id, level))
         })
         .collect()
 }
 
-/// The level map the engine writes for `minecraft:enchantments` and
-/// `minecraft:stored_enchantments` in 26.3: `{id: level}` with no wrapper.
-fn levels_component(levels: &[(String, u32)]) -> Tag {
-    Tag::compound(levels.iter().map(|(id, level)| {
-        (
-            id.as_str(),
-            Tag::Int(i32::try_from(*level).unwrap_or(i32::MAX)),
-        )
-    }))
+/// What dis-enchanting `stack` makes, if it can be (`DisEnchantingHelper.canDisenchant`).
+fn plan_of(stack: Option<&ItemStack>) -> Option<Plan> {
+    let stack = stack?;
+    runtime::plan(stack.item() == keys().enchanted_book, &enchantments(stack))
 }
 
-/// The component patch that makes an item the stripped (or split) input of
-/// `plan`: the enchantments removed, or a book's first kept, and the
-/// prior-work penalty cleared (`resets_repair_cost`).
-fn strip_patch(item: &str, plan: &Plan) -> Compound {
-    /// The engine's explicit removal marker for one component: `!id` with an
-    /// empty compound, which `apply_components` reads as "this stack has none",
-    /// not as "leave the item's default".
-    fn remove(patch: &mut Compound, key: &str) {
-        patch.insert(
-            format!("!{key}").as_str().into(),
-            Tag::Compound(Compound::new()),
-        );
+/// A new enchanted book holding `levels` (`EnchantmentHelper.createBook` and `setEnchantments`).
+fn book(levels: &[Level]) -> ItemStack {
+    let mut stored = Compound::new();
+    for (id, level) in levels {
+        stored.insert(id.as_str().into(), Tag::Int(*level as i32));
     }
     let mut patch = Compound::new();
+    patch.insert(STORED_ENCHANTMENTS.0.into(), Tag::Compound(stored));
+    let mut stack = ItemStack::of(keys().enchanted_book);
+    // Ids and levels in range always decode.
+    let _ = stack.apply_components(&patch);
+    stack
+}
+
+/// The preview slot 2 shows for these inputs: the result, when the input can be dis-enchanted
+/// and a book waits beside it (`createResult`).
+fn preview(input: Option<&ItemStack>, extra: Option<&ItemStack>) -> Option<ItemStack> {
+    if !extra.is_some_and(|book| book.item() == keys().book) {
+        return None;
+    }
+    plan_of(input).map(|plan| book(plan.result()))
+}
+
+/// What the input becomes once its result is taken (`onTake`, `AutomaticDisEnchantingProcess`):
+/// an item loses its enchantments (and its anvil cost when the server says so), a book becomes a
+/// new enchanted book with the enchantments it kept.
+fn stripped(input: &ItemStack, plan: &Plan, settings: &ServerSettings) -> ItemStack {
     match plan {
-        Plan::Whole { .. } => remove(&mut patch, enchantment_component(item)),
-        // A book keeps its first enchantment (`onTake`'s book branch).
-        Plan::Split { kept, .. } => {
-            patch.insert(
-                KEY_STORED_ENCHANTMENTS.into(),
-                levels_component(std::slice::from_ref(kept)),
-            );
-        }
-    }
-    if DEFAULT_SETTINGS.resets_repair_cost {
-        remove(&mut patch, KEY_REPAIR_COST);
-    }
-    patch
-}
-
-/// A new enchanted book carrying `moved`.
-fn book_with(host: &dyn Host, moved: &[(String, u32)]) -> Option<ItemStack> {
-    let key = host.item_key(&Identifier::parse(ENCHANTED_BOOK_ITEM).ok()?)?;
-    let mut book = ItemStack::of(key);
-    let Tag::Compound(patch) = Tag::compound([(KEY_STORED_ENCHANTMENTS, levels_component(moved))])
-    else {
-        return None;
-    };
-    book.apply_components(&patch).ok()?;
-    Some(book)
-}
-
-// ---------------------------------------------------------------------------
-// The dis-enchant
-// ---------------------------------------------------------------------------
-
-/// A take paid in points, waiting for the server tick that can charge them: the
-/// console is the only surface that takes points (`give_experience_points` only
-/// gives them, and `commands()` refuses inside a player's hook). The result is
-/// granted *after* the charge runs, so no output ever exists before it is paid
-/// for.
-pub(crate) struct PendingTake {
-    name: String,
-    uuid: u128,
-    pos: [i32; 3],
-    plan: Plan,
-    moved: Vec<(String, u32)>,
-    points: u32,
-}
-
-/// The takes a click queued and the points they already promised, by player:
-/// the bar has not moved yet, so a second click would otherwise pass the same
-/// affordability check.
-#[derive(Default)]
-pub(crate) struct Charges {
-    pending: Mutex<Vec<PendingTake>>,
-    reserved: Mutex<Vec<(u128, u64)>>,
-}
-
-impl Charges {
-    fn reserve(&self, uuid: u128, points: u32) {
-        let mut guard = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
-        match guard.iter_mut().find(|(id, _)| *id == uuid) {
-            Some((_, total)) => *total += u64::from(points),
-            None => guard.push((uuid, u64::from(points))),
-        }
-    }
-
-    fn promised(&self, uuid: u128) -> u64 {
-        let guard = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
-        guard
-            .iter()
-            .find(|(id, _)| *id == uuid)
-            .map_or(0, |(_, total)| *total)
-    }
-
-    fn release(&self, uuid: u128, points: u32) {
-        let mut guard = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((_, total)) = guard.iter_mut().find(|(id, _)| *id == uuid) {
-            *total = total.saturating_sub(u64::from(points));
-        }
-        guard.retain(|(_, total)| *total > 0);
-    }
-
-    fn queue(&self, take: PendingTake) {
-        self.pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(take);
-    }
-
-    fn take_pending(&self) -> Vec<PendingTake> {
-        let mut guard = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-        std::mem::take(&mut *guard)
-    }
-}
-
-/// A right click on the table with an eligible input, a book and an empty
-/// output slot: upstream's `onTake` in one step — strip or split the input,
-/// spend one book, put the produced enchanted book in the output slot, charge
-/// the experience — and consume the click. Anything else answers `None`, so the
-/// click falls through to the template's use path and opens the menu, and every
-/// refusal leaves all three slots exactly as they were.
-pub(crate) fn disenchant(
-    charges: &Charges,
-    host: &mut dyn ServerHost,
-    click: &BlockClick<'_>,
-) -> Option<InteractionResult> {
-    let player = host.player(click.player)?;
-    let level = player.level(&*host)?;
-    let entity = host.block_entity(level, click.pos)?;
-    let slots = read_slots(&*host, entity)?;
-    // The produced book waits in the output slot; a click then opens the menu.
-    if slots.output.is_some() {
-        return None;
-    }
-    // The book slot must hold an actual book, not merely nothing: a hopper can
-    // put anything in, and the take spends whatever sits there.
-    let book = slots.book?;
-    if !is_book(&book.item().id(&*host)) {
-        return None;
-    }
-    let input = slots.input?;
-    let levels = levels_of(&*host, &input);
-    let view: Vec<(&str, u32)> = levels
-        .iter()
-        .map(|(id, level)| (id.as_str(), *level))
-        .collect();
-    let plan = plan_take(&input.item().id(&*host), &view)?;
-    let moved = match &plan {
-        Plan::Whole { moved } | Plan::Split { moved, .. } => moved.clone(),
-    };
-    let cost = charge(
-        DEFAULT_SETTINGS,
-        player.is_creative(&*host).unwrap_or(false),
-    );
-    let (xp_level, xp_progress) = player.experience(&*host).map_or((0, 0.0), |experience| {
-        (experience.level, experience.progress)
-    });
-    // A take already queued this tick has promised its points but not spent
-    // them, so the bar still reads the old balance.
-    if !affordable_with(cost, xp_level, xp_progress, charges.promised(player.uuid())) {
-        let _ = player.action_bar(host, Text::literal("Not enough experience to dis-enchant"));
-        return None;
-    }
-    match cost {
-        // Paid in points: charge first, next tick, then hand the result over.
-        Charge::Points(points) => {
-            let name = player.name(&*host)?;
-            charges.reserve(player.uuid(), points);
-            charges.queue(PendingTake {
-                name,
-                uuid: player.uuid(),
-                pos: click.pos,
-                plan,
-                moved,
-                points,
-            });
-            let _ = player.action_bar(host, Text::literal("Dis-enchanting costs 25 experience"));
-            Some(InteractionResult::Consume)
-        }
-        // Levels come off here, where the acting player is reachable.
-        Charge::Levels(levels) => {
-            let levels = i32::try_from(levels).unwrap_or(i32::MAX);
-            if !player.give_levels(host, -levels) {
-                return None;
+        Plan::Whole { .. } => {
+            let mut item = input.clone();
+            // Setting either to its default value takes it out of the patch.
+            if settings.resets_repair_cost {
+                item.remove(&REPAIR_COST);
             }
-            if !finish(host, level, click.pos, &plan, &moved) {
-                // The write did not happen: give the levels back.
-                let _ = player.give_levels(host, levels);
-            }
-            Some(InteractionResult::Consume)
+            item.remove(&ENCHANTMENTS);
+            item
         }
-        Charge::Nothing => {
-            finish(host, level, click.pos, &plan, &moved).then_some(InteractionResult::Consume)
-        }
+        Plan::Split { rest, .. } => book(rest),
     }
 }
 
-/// Strips or splits the input, spends one book and puts the produced book in the
-/// output slot — upstream's `onTake` in one step. Every slot write is in the
-/// caller's transaction, so a refusal anywhere leaves all three as they were.
-fn finish(
-    host: &mut dyn ServerHost,
-    level: LevelRef,
-    pos: [i32; 3],
-    plan: &Plan,
-    moved: &[(String, u32)],
-) -> bool {
-    host.transaction(|host, tx| -> Result<bool, ()> {
-        let Some(entity) = host.block_entity(level, pos) else {
-            return Ok(false);
-        };
-        let Ok(input) = entity.item_slot(&*host, INPUT_SLOT as u32) else {
-            return Ok(false);
-        };
-        let Ok(book) = entity.item_slot(&*host, BOOK_SLOT as u32) else {
-            return Ok(false);
-        };
-        let Ok(output) = entity.item_slot(&*host, OUTPUT_SLOT as u32) else {
-            return Ok(false);
-        };
-        if output.is_some_and(|stack| stack.count() > 0) {
-            return Ok(false);
-        }
-        let Some(input) = input.filter(|stack| stack.count() > 0) else {
-            return Ok(false);
-        };
-        // The book is spent here, so it must still be one: a hopper, a save, or
-        // the tick between the click and the charge may have put something else
-        // there.
-        let Some(book) =
-            book.filter(|stack| stack.count() > 0 && is_book(&stack.item().id(&*host)))
-        else {
-            return Ok(false);
-        };
-        let item = input.item().id(&*host);
-        let patch = strip_patch(&item, plan);
-        let mut stripped = input;
-        stripped.apply_components(&patch).map_err(|_| ())?;
-        let produced = book_with(&*host, moved).ok_or(())?;
-        let left = book.count().saturating_sub(1);
-        let mut book_left = book;
-        let book_left = (left > 0 && book_left.set_count(left).is_ok()).then_some(book_left);
-        entity
-            .set_item_slot(host, tx, INPUT_SLOT as u32, Some(stripped))
-            .map_err(|_| ())?;
-        entity
-            .set_item_slot(host, tx, BOOK_SLOT as u32, book_left)
-            .map_err(|_| ())?;
-        entity
-            .set_item_slot(host, tx, OUTPUT_SLOT as u32, Some(produced))
-            .map_err(|_| ())?;
-        // Vanilla's `setChanged`: comparators and any open menu re-read the
-        // slots, as upstream's own slot writes notify.
-        let _ = entity.set_changed(host);
-        Ok(true)
-    })
-    .unwrap_or(false)
+// ---- experience -----------------------------------------------------------------------------
+
+/// `DisEnchantingStrategy.hasEnoughExperience`.
+fn has_enough(host: &dyn Host, player: PlayerRef, settings: &ServerSettings) -> bool {
+    if !settings.requires_experience
+        || player.abilities(host).is_some_and(|a| a.instabuild)
+        || player.is_creative(host) == Some(true)
+    {
+        return true;
+    }
+    player
+        .experience(host)
+        .is_some_and(|xp| runtime::has_enough(settings, xp.level, xp.progress))
 }
 
-/// End of a running server tick (`server_tick`): run the charges the clicks
-/// queued. `commands().run_command` is the only surface that takes experience
-/// points, and it refuses inside a player's hook, so the click cannot charge
-/// itself.
-pub(crate) fn run_charges(charges: &Charges, host: &mut dyn ServerHost) {
-    for take in charges.take_pending() {
-        let line = format!("xp add {} -{} points", take.name, take.points);
-        if !host.commands().run_command(&line) {
-            // Nothing was charged and nothing is granted; the promise goes.
-            charges.release(take.uuid, take.points);
+/// Takes a dis-enchant's cost from `player`, when the server asks for one and the player has it.
+/// Points go through `/xp add`, which takes a negative amount: the API's point grant takes only
+/// positive ones (sunrise-org/sunrise#5013).
+fn charge(host: &mut dyn ServerHost, player: PlayerRef, settings: &ServerSettings) {
+    if !settings.requires_experience || !has_enough(&*host, player, settings) {
+        return;
+    }
+    let cost = settings.experience_cost;
+    if settings.uses_points {
+        let uuid = player.uuid();
+        let uuid = format!(
+            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+            uuid >> 96,
+            (uuid >> 80) & 0xFFFF,
+            (uuid >> 64) & 0xFFFF,
+            (uuid >> 48) & 0xFFFF,
+            uuid & 0xFFFF_FFFF_FFFF
+        );
+        host.commands()
+            .run_command(&format!("xp add {uuid} {} points", -i64::from(cost)));
+    } else {
+        player.give_levels(host, -cost);
+    }
+}
+
+// ---- the block entity -----------------------------------------------------------------------
+
+fn flag(nbt: &Compound, key: &str) -> bool {
+    matches!(nbt.get(&JavaString::from(key)), Some(Tag::Byte(1)))
+}
+
+fn byte(on: bool) -> Option<Tag> {
+    Some(Tag::Byte(i8::from(on)))
+}
+
+/// The nearest player within 16 blocks of the table's corner who is not a spectator
+/// (`Level.getNearestPlayer(x, y, z, 16, false)`).
+fn nearest_player(host: &dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> Option<PlayerRef> {
+    let corner = pos.map(f64::from);
+    let mut best: Option<(f64, PlayerRef)> = None;
+    for player in host.players().server_players() {
+        if player.level(host) != Some(level) || player.is_spectator(host) != Some(false) {
             continue;
         }
-        let level = host
-            .player(take.uuid)
-            .and_then(|player| player.level(&*host));
-        let applied =
-            level.is_some_and(|level| finish(host, level, take.pos, &take.plan, &take.moved));
-        if !applied && let Some(player) = host.player(take.uuid) {
-            // The table or its output slot is gone: refund, so a paid-for take
-            // never vanishes.
-            let _ = player.give_experience_points(host, take.points);
+        let Some(at) = player.entity().position(host) else {
+            continue;
+        };
+        let dist = (0..3).map(|i| (at[i] - corner[i]).powi(2)).sum::<f64>();
+        if dist < 16.0 * 16.0 && best.is_none_or(|(b, _)| dist < b) {
+            best = Some((dist, player));
         }
-        charges.release(take.uuid, take.points);
     }
+    best.map(|(_, player)| player)
 }
 
-// ---------------------------------------------------------------------------
-// The readout
-// ---------------------------------------------------------------------------
-
-/// The `/disenchanting_table info <pos>` line: one line with the input, book and
-/// output slots and their enchantments, the cost, the player's points and
-/// level, and whether the slots hold what a dis-enchant needs (the experience is
-/// reported beside it, not folded in).
-pub(crate) fn readout(
-    host: &mut dyn ServerHost,
-    pos: [i32; 3],
-    player: Option<PlayerRef>,
-) -> String {
-    let level = player
-        .and_then(|player| player.level(&*host))
-        .or_else(|| host.level(host.dimension()));
-    let Some(level) = level else {
-        return "minecraft:air: not a dis-enchanting table".to_owned();
-    };
-    let block = level
-        .block(&*host, pos)
-        .map_or_else(|| "minecraft:air".to_owned(), |block| block.id(&*host));
-    if !crate::runtime::is_table(&block) {
-        return format!("{block}: not a dis-enchanting table");
-    }
-    let Some(slots) = host
-        .block_entity(level, pos)
-        .and_then(|entity| read_slots(&*host, entity))
-    else {
-        return format!("{block}: not a dis-enchanting table");
-    };
-    let cost = match charge(DEFAULT_SETTINGS, false) {
-        Charge::Points(points) => u64::from(points),
-        Charge::Levels(levels) => u64::from(levels),
-        Charge::Nothing => 0,
-    };
-    let (points, experience_level) =
-        player
-            .and_then(|player| player.experience(&*host))
-            .map_or((0, 0), |experience| {
-                (
-                    total_points(experience.level, experience.progress),
-                    experience.level,
-                )
-            });
-    let ready = slots.output.is_none()
-        && slots.input.as_ref().is_some_and(|input| {
-            let levels = levels_of(&*host, input);
-            let view: Vec<(&str, u32)> = levels
-                .iter()
-                .map(|(id, level)| (id.as_str(), *level))
-                .collect();
-            crate::runtime::can_disenchant(&input.item().id(&*host), &view)
-        })
-        && slots
-            .book
-            .as_ref()
-            .is_some_and(|book| is_book(&book.item().id(&*host)));
-    let name = |stack: Option<&ItemStack>| {
-        stack.map_or_else(|| "none".to_owned(), |stack| stack.item().id(&*host))
-    };
-    let enchantments = |stack: Option<&ItemStack>| {
-        stack.map_or_else(
-            || "none".to_owned(),
-            |stack| enchant_list(&levels_of(&*host, stack)),
+/// The table's tick. In manual mode it keeps slot 2's preview in step with the inputs; in
+/// automatic mode it is upstream's `tick`: the nearest player pays, and every
+/// `automatic_disenchanting_ticks` a valid input is dis-enchanted into slot 2.
+fn tick(event: &mut BlockEntityTickEvent<'_>) {
+    let settings = server_settings();
+    let scope = &mut event.subject;
+    let Some((level, pos, items, nbt, data)) = scope.with_view(|view| {
+        let items: [Option<ItemStack>; 3] =
+            std::array::from_fn(|i| view.item_slot(i as u32).and_then(|s| s.to_owned()));
+        (
+            view.level(),
+            view.position(),
+            items,
+            view.nbt().clone(),
+            view.data_slots().to_vec(),
         )
+    }) else {
+        return;
     };
-    format!(
-        "{block}: input={} input_ench={} book={} output={} output_ench={} cost={cost} xp={points} \
-         level={experience_level} ready={ready}",
-        name(slots.input.as_ref()),
-        enchantments(slots.input.as_ref()),
-        name(slots.book.as_ref()),
-        name(slots.output.as_ref()),
-        enchantments(slots.output.as_ref()),
-    )
-}
-
-/// `minecraft:sharpness:3,minecraft:unbreaking:2`, or `none` when there are no
-/// enchantments.
-fn enchant_list(levels: &[(String, u32)]) -> String {
-    if levels.is_empty() {
-        return "none".to_owned();
+    let was_preview = flag(&nbt, PREVIEW);
+    let mut new_items = items.clone();
+    let mut progress = match nbt.get(&JavaString::from(PROGRESS)) {
+        Some(Tag::Int(p)) => *p,
+        _ => 0,
+    };
+    let mut is_preview = was_preview;
+    let mut disenchanted = None;
+    if !settings.automatic_disenchanting {
+        progress = 0;
+        // A real item in slot 2 (left from automatic mode) waits to be taken.
+        if items[2].is_none() || was_preview {
+            new_items[2] = preview(items[0].as_ref(), items[1].as_ref());
+            is_preview = new_items[2].is_some();
+        }
+    } else {
+        if was_preview {
+            new_items[2] = None;
+            is_preview = false;
+        }
+        let host = scope.host();
+        let player = nearest_player(&*host, level, pos)
+            .filter(|&player| has_enough(&*host, player, &settings));
+        let plan = plan_of(new_items[0].as_ref());
+        match (player, plan) {
+            (Some(player), Some(plan))
+                if new_items[1]
+                    .as_ref()
+                    .is_some_and(|b| b.item() == keys().book)
+                    && new_items[2].is_none() =>
+            {
+                if progress >= settings.automatic_disenchanting_ticks {
+                    let input = new_items[0].take().expect("a plan has an input");
+                    new_items[2] = Some(book(plan.result()));
+                    new_items[0] = Some(stripped(&input, &plan, &settings));
+                    new_items[1] = new_items[1].take().and_then(|b| b.shrink(1));
+                    disenchanted = Some(player);
+                    progress = 0;
+                }
+                progress += 1;
+            }
+            (Some(_), _) => progress = 0,
+            (None, _) => progress = 0,
+        }
     }
-    levels
-        .iter()
-        .map(|(id, level)| format!("{id}:{level}"))
-        .collect::<Vec<_>>()
-        .join(",")
+    if let Some(player) = disenchanted {
+        let host = scope.host();
+        charge(host, player, &settings);
+        level.level_event(host, DISENCHANT_EVENT, pos, 0);
+    }
+    let shown = if settings.automatic_disenchanting {
+        new_items[0]
+            .as_ref()
+            .and_then(|stack| stack.to_nbt(&*scope.host()))
+    } else {
+        None
+    };
+    let rule = settings.cost_rule();
+    let mut sync = false;
+    scope.with_view(|mut view| {
+        for (slot, (old, new)) in items.iter().zip(&new_items).enumerate() {
+            if old != new {
+                let _ = view.set_item_slot(slot as u32, new.clone());
+            }
+        }
+        let wanted = [progress, rule];
+        if data.as_slice() != wanted {
+            view.set_data_slots(&wanted);
+        }
+        if is_preview != was_preview {
+            view.set_nbt(PREVIEW.into(), byte(is_preview));
+        }
+        let saved = settings
+            .automatic_disenchanting
+            .then_some(Tag::Int(progress));
+        if nbt.get(&JavaString::from(PROGRESS)) != saved.as_ref() {
+            view.set_nbt(PROGRESS.into(), saved);
+        }
+        if flag(&nbt, AUTOMATIC) != settings.automatic_disenchanting {
+            view.set_nbt(AUTOMATIC.into(), byte(settings.automatic_disenchanting));
+            sync = true;
+        }
+        let shown = shown.map(Tag::Compound);
+        if nbt.get(&JavaString::from(SHOWN)) != shown.as_ref() {
+            view.set_nbt(SHOWN.into(), shown);
+            sync = true;
+        }
+    });
+    if sync {
+        scope.host().block_entity_sync(pos);
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Shared reads
-// ---------------------------------------------------------------------------
+/// The block entity a player's open menu at `pos` stands on, when it is this table.
+fn table_at(host: &dyn Host, player: PlayerRef, pos: [i32; 3]) -> Option<mod_api::BlockEntityRef> {
+    let level = player.level(host)?;
+    let entity = host.block_entity(level, pos)?;
+    (entity.kind(host)? == keys().kind).then_some(entity)
+}
 
-/// The table's three slots, cloned out of its block entity.
-fn read_slots(host: &dyn Host, entity: BlockEntityRef) -> Option<TableSlots> {
-    let slot = |index: usize| {
-        entity
-            .item_slot(host, index as u32)
+/// The preview flag of the table a player has open, read from its saved data.
+fn preview_shown(host: &dyn Host, player: PlayerRef, pos: [i32; 3]) -> Option<bool> {
+    let entity = table_at(host, player, pos)?;
+    Some(flag(&entity.data(host)?, PREVIEW))
+}
+
+/// Manual mode, as the table's menu closes: the closing player gets the inputs back
+/// (`ItemCombinerMenu.removed`), and the preview goes. A player whose inventory is full gets
+/// them dropped at their feet.
+pub(crate) fn close(host: &mut dyn ServerHost, player: u128, pos: Option<[i32; 3]>) {
+    if server_settings().automatic_disenchanting {
+        return;
+    }
+    let Some(pos) = pos else {
+        return;
+    };
+    let Some(player) = host.player(player) else {
+        return;
+    };
+    let Some(entity) = table_at(&*host, player, pos) else {
+        return;
+    };
+    let shows_preview = entity.data(&*host).is_some_and(|data| flag(&data, PREVIEW));
+    let mut returned = Vec::new();
+    let _ = host.transaction(|host, tx| {
+        for slot in [INPUT, BOOK] {
+            if let Ok(Some(stack)) = entity.item_slot(&*host, slot) {
+                entity.set_item_slot(host, tx, slot, None).map_err(|_| ())?;
+                returned.push(stack);
+            }
+        }
+        if shows_preview {
+            entity
+                .set_item_slot(host, tx, OUTPUT, None)
+                .map_err(|_| ())?;
+        }
+        Ok::<(), ()>(())
+    });
+    for stack in returned {
+        if let Ok(Some(left)) = player.give_stack(host, stack) {
+            let _ = player.drop_stack(host, left, false);
+        }
+    }
+}
+
+/// Manual mode, as a player opens the table: refused while another player has it open, since
+/// the inputs are the table's own slots.
+pub(crate) fn in_use_by_another(host: &dyn ServerHost, player: u128, pos: [i32; 3]) -> bool {
+    if server_settings().automatic_disenchanting {
+        return false;
+    }
+    let Some(player) = host.player(player) else {
+        return false;
+    };
+    let Some(entity) = table_at(host, player, pos) else {
+        return false;
+    };
+    entity
+        .viewers(host)
+        .is_some_and(|viewers| viewers.iter().any(|v| v.uuid() != player.uuid()))
+}
+
+pub(crate) struct Table;
+
+#[mod_api::sunrise_part]
+impl BlockPart for Table {
+    /// `animateTick`: three portal particles that drift out from the table's corners.
+    fn animate_tick(&self, host: &mut dyn ClientHost, event: &mut AnimateTickEvent<'_>) {
+        if !client_settings().render_block_particles {
+            return;
+        }
+        let p = event.pos;
+        let portal = ParticleOptions::simple(keys().portal);
+        for _ in 0..3 {
+            let x_side = event.random.next_int_bound(2);
+            let z_side = event.random.next_int_bound(2);
+            let floats = std::array::from_fn(|_| event.random.next_float());
+            let (at, velocity) = runtime::portal_particle([p.x, p.y, p.z], x_side, z_side, floats);
+            host.add_particle(&portal, at, velocity);
+        }
+    }
+}
+
+#[mod_api::sunrise_part]
+impl BlockEntityPart for Table {
+    fn block_entity_ticks(&self, _: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
+        event.ticks = true;
+    }
+
+    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
+        tick(event);
+    }
+
+    /// Hoppers fill the input and the book in automatic mode only.
+    fn can_place_item(&self, event: &mut CanPlaceItemEvent<'_>) -> Option<bool> {
+        let allowed = server_settings().automatic_disenchanting
+            && match event.slot as u32 {
+                INPUT => plan_of(Some(event.stack)).is_some(),
+                BOOK => event.stack.item() == keys().book,
+                _ => false,
+            };
+        Some(allowed)
+    }
+
+    /// Manual mode's `onTake`: the input loses what the result took, a book is used, the player
+    /// pays, and the table shows the next preview.
+    fn menu_slot_take(&self, event: &mut MenuSlotTakeEvent<'_>) {
+        let settings = server_settings();
+        if event.slot != OUTPUT as usize || settings.automatic_disenchanting {
+            return;
+        }
+        let scope = &mut event.subject;
+        let Some((level, pos, input, extra, was_preview)) = scope.with_view(|view| {
+            (
+                view.level(),
+                view.position(),
+                view.item_slot(INPUT).and_then(|s| s.to_owned()),
+                view.item_slot(BOOK).and_then(|s| s.to_owned()),
+                flag(view.nbt(), PREVIEW),
+            )
+        }) else {
+            return;
+        };
+        // A real item left from automatic mode is just taken.
+        let Some(plan) = was_preview.then(|| plan_of(input.as_ref())).flatten() else {
+            return;
+        };
+        let input = input.map(|i| stripped(&i, &plan, &settings));
+        let extra = extra.and_then(|b| b.shrink(1));
+        let next = preview(input.as_ref(), extra.as_ref());
+        scope.with_view(|mut view| {
+            let _ = view.set_item_slot(INPUT, input);
+            let _ = view.set_item_slot(BOOK, extra);
+            let _ = view.set_item_slot(OUTPUT, next.clone());
+            view.set_nbt(PREVIEW.into(), byte(next.is_some()));
+        });
+        let host = scope.host();
+        if let Some(player) = host.player(event.player) {
+            charge(host, player, &settings);
+        }
+        if client_settings().render_block_particles {
+            level.level_event(host, DISENCHANT_EVENT, pos, 0);
+        }
+    }
+
+    /// Breaking the table drops what it holds; in manual mode the preview is not an item.
+    fn pre_remove_side_effects(
+        &self,
+        _: &mut dyn mod_api::LevelRandomHost,
+        event: &mut PreRemoveSideEffectsEvent<'_>,
+    ) {
+        if flag(&event.entity.nbt, PREVIEW) {
+            event.keep_contents = true;
+            let items = &event.entity.items;
+            for slot in [INPUT, BOOK] {
+                event
+                    .drops
+                    .push(items.get(slot as usize).cloned().flatten());
+            }
+        }
+    }
+
+    /// What clients get: the mode and, in automatic mode, the item on top.
+    fn block_entity_update_tag(
+        &self,
+        event: &mut BlockEntityUpdateTagEvent<'_>,
+    ) -> Option<Compound> {
+        let mut tag = Compound::new();
+        for key in [AUTOMATIC, SHOWN] {
+            if let Some(value) = event.entity.nbt.get(&JavaString::from(key)) {
+                tag.insert(key.into(), value.clone());
+            }
+        }
+        Some(tag)
+    }
+
+    /// Upstream's renderer: an enchanted book lies on the table in manual mode, the input in
+    /// automatic mode, half size, flat, turned to the table's front.
+    fn block_entity_submit(&self, host: &dyn ClientHost, event: &mut BlockEntitySubmitEvent<'_>) {
+        if !client_settings().render_table_item {
+            return;
+        }
+        let nbt = &event.entity.nbt;
+        let stack = if flag(nbt, AUTOMATIC) {
+            match nbt.get(&JavaString::from(SHOWN)) {
+                Some(Tag::Compound(shown)) => ItemStack::from_nbt(host, shown),
+                _ => None,
+            }
+        } else {
+            Some(ItemStack::of(keys().enchanted_book))
+        };
+        let Some(stack) = stack else {
+            return;
+        };
+        let states = host.block_states();
+        let facing = event
+            .state
+            .property(&states, "facing")
             .ok()
             .flatten()
-            .filter(|stack| stack.count() > 0)
-    };
-    Some(TableSlots {
-        input: slot(INPUT_SLOT),
-        book: slot(BOOK_SLOT),
-        output: slot(OUTPUT_SLOT),
-    })
-}
-
-/// The command's `<pos>` argument, resolved by the server's dispatcher.
-pub(crate) fn block_pos(argument: Option<&CommandArgumentValue>) -> Option<[i32; 3]> {
-    match argument? {
-        CommandArgumentValue::BlockPos(pos) => Some(*pos),
-        _ => None,
+            .unwrap_or("north");
+        let draw = &mut *event.draw;
+        draw.push();
+        draw.translate([0.5, 0.75, 0.5]);
+        draw.scale([0.5, 0.5, 0.5]);
+        draw.rotate_about([0.0, 1.0, 0.0], runtime::item_yaw(facing), [0.0, 0.0, 0.0]);
+        draw.rotate_about([1.0, 0.0, 0.0], 90.0, [0.0, 0.0, 0.0]);
+        draw.item(
+            &stack,
+            ItemDisplayContext::Fixed,
+            None,
+            runtime::pos_seed(event.pos),
+        );
+        draw.pop();
     }
 }
 
-// ---------------------------------------------------------------------------
-// Parts
-// ---------------------------------------------------------------------------
+// ---- the menu -------------------------------------------------------------------------------
 
-/// The table's declaration parts: the block entity and its screen.
-pub(crate) struct TablePart;
+pub(crate) struct TableMenu;
 
-#[mod_api::horizon_part]
-impl BlockPart for TablePart {}
-
-#[mod_api::horizon_part]
-impl BlockEntityPart for TablePart {
-    /// `EntityBlock.newBlockEntity`: the slots are its whole state, so it saves
-    /// nothing of its own and a reverted write inside a tick has nothing to lose.
-    fn block_entity(
-        &self,
-        _level: LevelSide,
-        _event: &mut BlockEntityEvent<'_>,
-    ) -> Option<Compound> {
-        Some(Compound::new())
-    }
-
-    /// The table's three-slot layout on an open menu.
-    fn screen(&self, _host: &dyn Host, _event: &mut ScreenEvent<'_>) -> Option<Screen> {
-        Some(menu())
-    }
-
-    /// The cost under the book slot.
-    fn screen_draw(&self, _host: &dyn ClientHost, event: &mut ScreenDrawEvent<'_>) {
-        let cost = match charge(DEFAULT_SETTINGS, false) {
-            Charge::Points(points) => format!("{points} XP"),
-            Charge::Levels(levels) => format!("{levels} levels"),
-            Charge::Nothing => "free".to_owned(),
-        };
-        let [x, y] = event.origin;
-        event
-            .draw
-            .text(&cost, [x + 8.0, y + 68.0], 0xFF40_4040, false);
-    }
-}
-
-/// The click: a right click with a hand, either empty or full.
-pub(crate) struct ClickPart {
-    pub(crate) charges: Arc<Charges>,
-}
-
-#[mod_api::horizon_part]
-impl BlockPart for ClickPart {
-    fn use_item_on(
-        &self,
-        host: &mut dyn ServerHost,
-        event: &mut UseItemOnEvent<'_>,
-    ) -> Option<InteractionResult> {
-        disenchant(&self.charges, host, event.click)
-    }
-
-    /// The same click with an empty hand: the SDK asks `use_without_item` for
-    /// the main hand when the block's `use_item_on` asks for it, and an empty
-    /// hand must dis-enchant too.
-    fn use_without_item(
-        &self,
-        host: &mut dyn ServerHost,
-        event: &mut UseWithoutItemEvent<'_>,
-    ) -> Option<InteractionResult> {
-        disenchant(&self.charges, host, event.click)
-    }
-}
-
-/// The menu's slot rules.
-pub(crate) struct MenuRulesPart;
-
-#[mod_api::horizon_part]
-impl MenuPart for MenuRulesPart {
+#[mod_api::sunrise_part]
+impl MenuPart for TableMenu {
+    /// The slots' rules, the same in both modes: slot 0 takes what can be dis-enchanted, slot 1
+    /// books, slot 2 nothing. In manual mode the preview is taken only by a player with the
+    /// experience for it, and only while the inputs still make it.
     fn menu_slot_rules(&self, host: &dyn Host, event: &mut MenuSlotRulesEvent<'_>) {
-        let item = event.stack.item().id(host);
-        let levels = levels_of(host, event.stack);
-        let view: Vec<(&str, u32)> = levels
-            .iter()
-            .map(|(id, level)| (id.as_str(), *level))
-            .collect();
-        slot_rule(
-            event.menu,
-            event.slot,
-            &item,
-            &view,
-            &mut event.may_place,
-            &mut event.max_stack,
-        );
+        if event.container != MenuContainer::Main {
+            return;
+        }
+        match event.slot as u32 {
+            INPUT => event.may_place = plan_of(Some(event.stack)).is_some(),
+            BOOK => event.may_place = event.stack.item() == keys().book,
+            _ => {
+                event.may_place = false;
+                let settings = server_settings();
+                if settings.automatic_disenchanting {
+                    return;
+                }
+                let context = event.context;
+                let (Some(player), Some(pos)) = (
+                    context.player.and_then(|uuid| host.player(uuid)),
+                    context.pos,
+                ) else {
+                    return;
+                };
+                // The client may not see the flag: it predicts a preview, the server corrects.
+                if preview_shown(host, player, pos) == Some(false) {
+                    return;
+                }
+                let input = context.slot(MenuContainer::Main, INPUT as usize);
+                let extra = context.slot(MenuContainer::Main, BOOK as usize);
+                let made = preview(input.as_ref(), extra.as_ref()).as_ref() == Some(event.stack);
+                event.may_pickup = made && has_enough(host, player, &settings);
+            }
+        }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::runtime::TABLE_BLOCK;
+// ---- the screen -----------------------------------------------------------------------------
 
-    #[test]
-    fn the_table_declares_three_slots_and_its_menu() {
-        let container = container();
-        assert_eq!(container.slots, SLOT_COUNT, "input, book and output");
-        assert_eq!(container.inputs, vec![INPUT_SLOT, BOOK_SLOT]);
-        assert_eq!(
-            container.outputs,
-            vec![INPUT_SLOT, OUTPUT_SLOT],
-            "upstream's canOutputToHopper"
-        );
-        assert_eq!(
-            container.faces,
-            std::array::from_fn(|_| vec![INPUT_SLOT, BOOK_SLOT, OUTPUT_SLOT]),
-            "a hopper reaches all three from every face"
-        );
-        assert_eq!(container.menu.as_deref(), Some(TABLE_MENU));
-    }
+/// The table's screen: upstream's background, no labels, and the red notice when the player
+/// can't pay.
+pub(crate) struct TableScreen;
 
-    #[test]
-    fn the_declared_type_is_the_table_s_own_block() {
-        assert_eq!(
-            format!("disenchanting_table:{TABLE_TYPE}"),
-            TABLE_BLOCK,
-            "the type's blocks are bare names in the mod's namespace"
-        );
-    }
-
-    #[test]
-    fn the_screen_is_upstream_s_panel_with_three_slots() {
-        let screen = menu();
-        assert_eq!([screen.width, screen.height], [176.0, 166.0]);
-        assert_eq!(
-            screen.slots,
-            vec![Some([27.0, 47.0]), Some([76.0, 47.0]), Some([134.0, 47.0])],
-            "DisEnchantingMenu's input, book and output"
-        );
-        assert_eq!([screen.inventory_x, screen.inventory_y], [8.0, 84.0]);
-        assert!(!screen.own_labels && !screen.own_background);
-    }
-
-    #[test]
-    fn the_enchantment_component_follows_the_item() {
-        assert_eq!(
-            enchantment_component("minecraft:diamond_sword"),
-            KEY_ENCHANTMENTS
-        );
-        assert_eq!(
-            enchantment_component(ENCHANTED_BOOK_ITEM),
-            KEY_STORED_ENCHANTMENTS,
-            "crafting_enchantments keeps a book's own ones"
-        );
-    }
-
-    #[test]
-    fn the_output_component_is_the_direct_level_map_the_engine_writes() {
-        let moved = vec![("minecraft:sharpness".to_owned(), 3)];
-        let Tag::Compound(map) = levels_component(&moved) else {
-            panic!("the level map is a compound");
+impl MenuScreenFactory for TableScreen {
+    fn create(&self, _: &dyn ClientHost, _: MenuScreenOpen<'_>) -> Option<MenuScreen> {
+        let slot = |x: f32| {
+            Some(ScreenSlot {
+                position: [x, 47.0],
+                ..Default::default()
+            })
         };
-        assert_eq!(map.len(), 1);
-        assert_eq!(
-            Tag::Compound(map).get("minecraft:sharpness"),
-            Some(&Tag::Int(3)),
-            "26.3 writes the map directly, with no `levels` wrapper"
-        );
-    }
-
-    #[test]
-    fn an_item_gives_every_enchantment_and_keeps_none() {
-        let plan = plan_take("minecraft:diamond_sword", &[("minecraft:sharpness", 3)])
-            .expect("an enchanted item has a plan");
-        let patch = Tag::Compound(strip_patch("minecraft:diamond_sword", &plan));
-        assert_eq!(
-            patch.get("!minecraft:enchantments"),
-            Some(&Tag::Compound(Compound::new())),
-            "the component is removed, not left empty"
-        );
-        assert_eq!(
-            patch.get("!minecraft:repair_cost"),
-            Some(&Tag::Compound(Compound::new())),
-            "resets_repair_cost clears the prior-work penalty"
-        );
-    }
-
-    #[test]
-    fn a_book_keeps_its_first_enchantment() {
-        let plan = plan_take(
-            ENCHANTED_BOOK_ITEM,
-            &[("minecraft:sharpness", 3), ("minecraft:unbreaking", 2)],
-        )
-        .expect("a two-enchantment book has a plan");
-        let patch = Tag::Compound(strip_patch(ENCHANTED_BOOK_ITEM, &plan));
-        let Some(Tag::Compound(kept)) = patch.get(KEY_STORED_ENCHANTMENTS) else {
-            panic!("a split sets the book's own component");
+        let layout = MenuScreenLayout {
+            width: 176.0,
+            height: 166.0,
+            slots: vec![slot(27.0), slot(76.0), slot(134.0)],
+            inventory_x: 8.0,
+            inventory_y: 84.0,
+            own_labels: true,
+            own_background: true,
+            ..Default::default()
         };
-        assert_eq!(kept.len(), 1);
-        assert_eq!(
-            Tag::Compound(kept.clone()).get("minecraft:sharpness"),
-            Some(&Tag::Int(3))
-        );
+        Some(MenuScreen::new(layout).with_draw(screen_draw))
     }
+}
 
-    #[test]
-    fn the_readout_lists_enchantments_compactly() {
-        let levels = vec![
-            ("minecraft:sharpness".to_owned(), 3),
-            ("minecraft:unbreaking".to_owned(), 2),
-        ];
-        assert_eq!(
-            enchant_list(&levels),
-            "minecraft:sharpness:3,minecraft:unbreaking:2"
-        );
-        assert_eq!(enchant_list(&[]), "none");
+fn screen_draw(host: &dyn ClientHost, frame: MenuScreenFrame<'_>, draw: &mut dyn DrawContext) {
+    let [x, y] = frame.origin;
+    draw.sprite(
+        "disenchanting_table:gui/container/disenchanting_table",
+        [0.0, 0.0, 176.0, 166.0],
+        [x, y, 176.0, 166.0],
+        None,
+    );
+    if !client_settings().render_experience_cost {
+        return;
     }
+    let Some(player) = host.local_player() else {
+        return;
+    };
+    let rule = frame.data.get(RULE_SLOT as usize).copied().unwrap_or(0);
+    let free = player.abilities(host).is_some_and(|a| a.instabuild)
+        || player.is_creative(host) == Some(true);
+    let enough = player
+        .experience(host)
+        .is_some_and(|xp| runtime::rule_met(i64::from(rule), xp.level, xp.progress));
+    if free || enough {
+        return;
+    }
+    // Upstream's literal text and colours.
+    let text = "Insufficient Experience!";
+    let (left, top) = (x + 45.0, y + 72.0);
+    draw.fill([left, top, draw.text_width(text) + 4.0, 11.0], 0xFF45_327F);
+    draw.text(text, [left + 2.0, top + 2.0], 0xFFFF_6060, true);
 }

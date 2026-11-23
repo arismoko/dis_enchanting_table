@@ -1,108 +1,185 @@
-//! Dis-Enchanting Table for Horizon — slice 1, the table.
-//!
-//! One flat SDK package (mod API 0.2): the carried block, its item, models,
-//! textures, lang, loot table, recipe, menu and tags are the `assets/` and
-//! `data/` here, and the behaviour is the one `impl Hooks` below. The rules
-//! themselves live in [`runtime`], byte-identical to the retired `.hnmod`
-//! bundle's `runtime.rs`; [`table`] is the glue.
-//!
-//! What the retired bundle expressed as nine injected helpers is here three
-//! shapes: the block entity and its screen are a **Part** (`table::TablePart`,
-//! attached to the type declared for the block), the click and the slot rules
-//! are two more Parts (`table::ClickPart` on the block, `table::MenuRulesPart`
-//! on the menu), the three slots are a **declaration**, and the readout is the
-//! typed `register_commands`/`run_mod_command` pair. Its embedded-content helper
-//! has no successor: one `.hmod` carries the content and the code, which is
-//! what that helper existed to work around.
-use std::sync::Arc;
+//! Dis-Enchanting Table for Sunrise: the edges between the game (`mod_api`) and the model
+//! (`runtime.rs`). The block, its block entity, its menu and screen are declared here; what they do
+//! is in `table.rs`.
 
-use mod_api::{
-    self, Command, CommandSource, Flow, Hooks, RegisterCommandsEvent, Registrar,
-    RegistrationContext, RunModCommandEvent, ServerHost, ServerTickEvent, ServerTickPhase, Text,
-};
-
-use crate::runtime::TABLE_MENU;
-use crate::table::{Charges, ClickPart, MenuRulesPart, TablePart};
-
-pub mod runtime;
-
+mod runtime;
 mod table;
 
-#[derive(Default)]
-struct Mod {
-    /// The takes the clicks queued and the points they already promised: the
-    /// Parts share it, so it is one state behind an `Arc` (a Part is attached
-    /// once and lives for the session).
-    charges: Arc<Charges>,
+use mod_api::{
+    Block, BlockEntityTypeKey, BlockKey, BlockProperties, BlockShapes, BlocksEvent,
+    Config as ModConfig, ConfigContext, ConfigKind, ConfigLoadingEvent, ConfigReloadingEvent, Flow,
+    Hooks, HostSide, InteractionResult, ItemKey, ModContainer, NoteInstrument, ParticleKey,
+    PlayerContainerCloseEvent, RegisterConfigsEvent, Registrar, RegistrationContext,
+    RightClickBlockEvent, ServerHost,
+};
+use runtime::{ClientSettings, ServerSettings};
+use std::collections::BTreeMap;
+use std::sync::{Mutex, OnceLock};
+
+const MOD: &str = "disenchanting_table";
+
+/// The registry keys the mod asks about, looked up once at registration.
+pub(crate) struct Keys {
+    pub kind: BlockEntityTypeKey,
+    pub book: ItemKey,
+    pub enchanted_book: ItemKey,
+    pub portal: ParticleKey,
 }
 
-#[mod_api::horizon_mod]
-impl Hooks for Mod {
-    /// Declare the table: one block with a block entity, three slots and its
-    /// menu, plus the Parts that give it its click and its slot rules.
-    ///
-    /// The type is declared with its block before the Part is attached to it
-    /// (`block_entity_part` refuses a key that named no type), and a refusal is
-    /// reported rather than ignored, so a broken declaration shows up at load.
-    fn register(&self, registrar: &mut dyn Registrar, context: &RegistrationContext) {
-        let block = registrar.block_key(crate::runtime::TABLE_BLOCK);
-        registrar.block_container(&block, table::container());
-        let kind = table::declare(registrar);
-        if let Err(error) = registrar.block_entity_part(&kind, TablePart) {
-            context.refuse(&error.to_string());
+static KEYS: OnceLock<Keys> = OnceLock::new();
+
+pub(crate) fn keys() -> &'static Keys {
+    KEYS.get()
+        .expect("the mod's keys are looked up at registration")
+}
+
+static SERVER: Mutex<ServerSettings> = Mutex::new(ServerSettings {
+    automatic_disenchanting: false,
+    automatic_disenchanting_ticks: 10,
+    resets_repair_cost: true,
+    requires_experience: true,
+    uses_points: true,
+    experience_cost: 25,
+});
+static CLIENT: Mutex<ClientSettings> = Mutex::new(ClientSettings {
+    render_block_particles: true,
+    render_experience_cost: true,
+    render_table_item: true,
+});
+
+/// The server file's settings (`disenchanting_table-server.toml`).
+pub(crate) fn server_settings() -> ServerSettings {
+    *SERVER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The client file's settings (`disenchanting_table-client.toml`).
+pub(crate) fn client_settings() -> ClientSettings {
+    *CLIENT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn apply(mod_id: &str, kind: ConfigKind, text: &str) {
+    if mod_id != MOD {
+        return;
+    }
+    match kind {
+        ConfigKind::Server => {
+            *SERVER.lock().unwrap_or_else(|e| e.into_inner()) = ServerSettings::parse(text)
         }
-        registrar.block_part(
-            block,
-            ClickPart {
-                charges: Arc::clone(&self.charges),
+        ConfigKind::Client => {
+            *CLIENT.lock().unwrap_or_else(|e| e.into_inner()) = ClientSettings::parse(text)
+        }
+        _ => {}
+    }
+}
+
+#[derive(Default)]
+struct Mod;
+
+#[mod_api::sunrise_mod]
+impl Hooks for Mod {
+    fn register(&self, r: &mut dyn Registrar, _: &RegistrationContext) {
+        let block: BlockKey = r.block_key(table::ID);
+        let kind = r.block_entity_type(table::ID).blocks(&[table::ID]).build();
+        r.block_entity_part(&kind, table::Table)
+            .expect("the table's block entity type is the mod's own");
+        r.block_part(block, table::Table);
+        // Hoppers fill the input and the book from any side; taking out waits on
+        // sunrise-org/sunrise#5014.
+        r.block_container(
+            &block,
+            ModContainer {
+                slots: 3,
+                faces: std::array::from_fn(|_| vec![0, 1]),
+                inputs: vec![0, 1],
+                menu: Some(table::ID.to_owned()),
+                ..Default::default()
             },
         );
-        registrar.menu_part(TABLE_MENU, MenuRulesPart);
+        r.menu_part(table::ID, table::TableMenu);
+        r.register_menu_screen(table::ID, std::sync::Arc::new(table::TableScreen))
+            .expect("the table's menu is the mod's own");
+        let _ = KEYS.set(Keys {
+            kind,
+            book: r.item_key("minecraft:book"),
+            enchanted_book: r.item_key("minecraft:enchanted_book"),
+            portal: r.particle_key("minecraft:portal"),
+        });
     }
 
-    /// The end of a running tick: run the experience charges the clicks queued.
-    /// The console is the only surface that takes points, and a player's hook
-    /// cannot reach it.
-    fn server_tick(&self, host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
-        if let ServerTickPhase::ServerTickEnd {
-            world_running: true,
-        } = event.phase
-        {
-            table::run_charges(&self.charges, host);
+    /// The table: the enchanting table's properties (`Properties.ofFullCopy(ENCHANTING_TABLE)`),
+    /// a furnace's facing, and upstream's 16 x 12 x 16 shape.
+    fn blocks(&self, _: &RegistrationContext, event: &mut BlocksEvent<'_>) {
+        let mut block = Block::new(table::ID, "minecraft:furnace").with_item(true);
+        block.properties = BlockProperties {
+            hardness: Some(5.0),
+            explosion_resistance: Some(1200.0),
+            light: Some(7),
+            requires_tool: Some(true),
+            sounds: Some("minecraft:stone".into()),
+            // MapColor.COLOR_RED.
+            map_color: Some(28),
+            instrument: Some(NoteInstrument::Basedrum),
+            occludes: Some(true),
+            ..Default::default()
+        };
+        let shape = BlockShapes {
+            properties: Vec::new(),
+            values: BTreeMap::new(),
+            default: Some(vec![[0.0, 0.0, 0.0, 1.0, 0.75, 1.0]]),
+        };
+        block.shapes = Some(shape.clone());
+        block.collision_shapes = Some(shape);
+        // A refused declaration is reported at startup with its reason.
+        let _ = event.register(block);
+    }
+
+    fn register_configs(&self, _: &dyn ConfigContext, event: &mut RegisterConfigsEvent<'_>) {
+        event.configs.push(ModConfig::new(
+            MOD,
+            ConfigKind::Server,
+            runtime::DEFAULT_SERVER,
+        ));
+        event.configs.push(ModConfig::new(
+            MOD,
+            ConfigKind::Client,
+            runtime::DEFAULT_CLIENT,
+        ));
+    }
+
+    fn config_loading(&self, _: &dyn ConfigContext, event: &mut ConfigLoadingEvent<'_>) {
+        apply(
+            event.config.mod_id.as_str(),
+            event.config.kind,
+            &event.config.text,
+        );
+    }
+
+    fn config_reloading(&self, _: HostSide, event: &mut ConfigReloadingEvent<'_>) {
+        apply(
+            event.config.mod_id.as_str(),
+            event.config.kind,
+            &event.config.text,
+        );
+    }
+
+    /// Manual mode: the table opens for one player at a time.
+    fn right_click_block(&self, host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) -> Flow {
+        let HostSide::Server(host) = host else {
+            return Flow::Continue;
+        };
+        if table::in_use_by_another(&*host, event.click.player, event.click.pos) {
+            *event.cancellation_result = InteractionResult::Fail;
+            Flow::Cancel
+        } else {
+            Flow::Continue
         }
     }
 
-    /// `/disenchanting_table info <x> <y> <z>`: the harness readout. Upstream
-    /// has no command; the usage is the one the retired bundle registered.
-    fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
-        event
-            .commands
-            .push(Command::new("disenchanting_table info <pos:block_pos>"));
-    }
-
-    /// The readout body: the dispatcher resolves `<pos>`, so this only reads the
-    /// table and answers.
-    fn run_mod_command(
+    fn player_container_close(
         &self,
         host: &mut dyn ServerHost,
-        event: &mut RunModCommandEvent<'_>,
-    ) -> Flow {
-        let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
-        if literals.as_slice() != ["disenchanting_table", "info"] {
-            return Flow::Continue;
-        }
-        let Some(pos) = table::block_pos(event.command.argument("pos")) else {
-            let _ = host.commands().feedback(Text::literal(
-                "usage: /disenchanting_table info <x> <y> <z>",
-            ));
-            return Flow::Cancel;
-        };
-        let player = match event.source {
-            CommandSource::Player { player, .. } => Some(*player),
-            _ => None,
-        };
-        let line = table::readout(host, pos, player);
-        let _ = host.commands().feedback(Text::literal(line));
-        Flow::Cancel
+        event: &mut PlayerContainerCloseEvent<'_>,
+    ) {
+        table::close(host, event.player, event.pos);
     }
 }

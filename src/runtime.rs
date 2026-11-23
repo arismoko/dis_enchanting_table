@@ -1,496 +1,416 @@
-// The Dis-Enchanting Table's pure engine: which item may be dis-enchanted,
-// what the output book takes, what each menu slot accepts, and the experience
-// cost model.
-//
-// Game-free: the build script's block entity, menu rules, interaction and
-// command are thin adapters over these functions, and the same file is the
-// standalone library's `cargo test` target.
-//
-// Read from Dis-Enchanting Table 5.0.2 (`DisEnchantingHelper`,
-// `DisEnchantingStrategy`, `DisEnchantingMenu`, `ExperienceHelper`) on the
-// upstream 1.21.6 branch; see `../../FINDINGS.md`. The experience thresholds are
-// vanilla's, not upstream's half-dropping `n / 2` sum.
+//! The port's pure model: the two config files, what a dis-enchant does to a stack's enchantments,
+//! the experience arithmetic and the table's particles. Nothing here touches the game.
 
-/// The item the extra slot takes (`SlotPredicates.VALID_EXTRA`).
-pub const BOOK_ITEM: &str = "minecraft:book";
+/// The server file's text when it does not exist yet (upstream's `disenchanting_table-server.toml`).
+pub const DEFAULT_SERVER: &str = include_str!("server.toml");
+/// The client file's text when it does not exist yet (upstream's `disenchanting_table-client.toml`).
+pub const DEFAULT_CLIENT: &str = include_str!("client.toml");
 
-/// The item whose enchantments are stored, not applied.
-pub const ENCHANTED_BOOK_ITEM: &str = "minecraft:enchanted_book";
-
-/// The block this port registers (`ModBlocks` uses `mod_id` for its own path).
-pub const TABLE_BLOCK: &str = "disenchanting_table:disenchanting_table";
-
-/// The menu type the content mod declares (`data/<id>/horizon/menu/<name>.json`).
-pub const TABLE_MENU: &str = "disenchanting_table:disenchanting_table";
-
-/// `TileEntityConstants.INPUT_SLOT` / `EXTRA_SLOT` / `OUTPUT_SLOT`.
-pub const INPUT_SLOT: usize = 0;
-pub const BOOK_SLOT: usize = 1;
-pub const OUTPUT_SLOT: usize = 2;
-pub const SLOT_COUNT: usize = 3;
-
-/// `disenchanting_table-server.toml`'s defaults.
-pub const DEFAULT_SETTINGS: Settings = Settings {
-    automatic_disenchanting: false,
-    automatic_disenchanting_ticks: 10,
-    resets_repair_cost: true,
-    requires_experience: true,
-    uses_points: true,
-    experience_cost: 25,
-};
-
-/// The server config this slice bakes in (no config API at the pin: a gap).
+/// `DisEnchantingTableServer`'s settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Settings {
-    /// `automatic_disenchanting`: a 10-tick auto mode; not ported (gap).
+pub struct ServerSettings {
     pub automatic_disenchanting: bool,
-    /// `automatic_disenchanting_ticks`.
-    pub automatic_disenchanting_ticks: u32,
-    /// `resets_repair_cost`: clear the input's prior-work penalty.
+    pub automatic_disenchanting_ticks: i32,
     pub resets_repair_cost: bool,
-    /// `requires_experience`.
     pub requires_experience: bool,
-    /// `uses_points`: charge points (true) or levels (false).
     pub uses_points: bool,
-    /// `experience_cost`: points or levels, by `uses_points`.
-    pub experience_cost: u32,
+    pub experience_cost: i32,
 }
 
-/// Whether `block` is this mod's table (never vanilla's enchanting table).
-#[must_use]
-pub fn is_table(block: &str) -> bool {
-    block == TABLE_BLOCK
-}
-
-/// Whether `item` is the extra slot's book (`Items.BOOK`, not a writable one).
-#[must_use]
-pub fn is_book(item: &str) -> bool {
-    item == BOOK_ITEM
-}
-
-/// Whether `item` stores its enchantments rather than applying them.
-#[must_use]
-pub fn is_enchanted_book(item: &str) -> bool {
-    item == ENCHANTED_BOOK_ITEM
-}
-
-/// `DisEnchantingHelper.canDisenchant`: `enchantments` are the stack's
-/// crafting enchantments (`ItemStack.crafting_enchantments`: the stored ones
-/// for an enchanted book, the applied ones otherwise).
-#[must_use]
-pub fn can_disenchant(item: &str, enchantments: &[(&str, u32)]) -> bool {
-    if enchantments.is_empty() {
-        return false;
+impl Default for ServerSettings {
+    /// Upstream's field initialisers, the same values as the default file.
+    fn default() -> Self {
+        Self {
+            automatic_disenchanting: false,
+            automatic_disenchanting_ticks: 10,
+            resets_repair_cost: true,
+            requires_experience: true,
+            uses_points: true,
+            experience_cost: 25,
+        }
     }
-    // A one-enchantment book would leave nothing behind, so it is refused.
-    !is_enchanted_book(item) || enchantments.len() >= 2
 }
 
-/// What a dis-enchant would produce and what would stay behind.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Plan {
-    /// The input was an ordinary enchanted item: the output book takes every
-    /// enchantment and the item keeps none.
-    Whole { moved: Vec<(String, u32)> },
-    /// The input was an enchanted book: it keeps its first enchantment and the
-    /// output book takes the rest.
-    Split {
-        kept: (String, u32),
-        moved: Vec<(String, u32)>,
-    },
+/// `DisEnchantingTableClient`'s settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientSettings {
+    pub render_block_particles: bool,
+    pub render_experience_cost: bool,
+    pub render_table_item: bool,
 }
 
-fn owned(levels: &[(&str, u32)]) -> Vec<(String, u32)> {
-    levels
-        .iter()
-        .map(|(id, level)| ((*id).to_owned(), *level))
-        .collect()
-}
-
-/// `DisEnchantingMenu.createResult`: the plan, or none when the input may not
-/// be dis-enchanted. The output is a new enchanted book of `moved`.
-#[must_use]
-pub fn plan(item: &str, enchantments: &[(&str, u32)]) -> Option<Plan> {
-    if !can_disenchant(item, enchantments) {
-        return None;
+impl Default for ClientSettings {
+    fn default() -> Self {
+        Self {
+            render_block_particles: true,
+            render_experience_cost: true,
+            render_table_item: true,
+        }
     }
-    if !is_enchanted_book(item) {
-        return Some(Plan::Whole {
-            moved: owned(enchantments),
-        });
-    }
-    let ((id, level), rest) = enchantments.split_first()?;
-    Some(Plan::Split {
-        kept: ((*id).to_owned(), *level),
-        moved: owned(rest),
+}
+
+/// The `key = value` pairs of a flat TOML file, comments and blank lines left out. A line that is
+/// not a pair is skipped, as is a value of the wrong type in the readers below: the setting keeps
+/// its default.
+fn pairs(text: &str) -> impl Iterator<Item = (&str, &str)> {
+    text.lines().filter_map(|line| {
+        let line = line.split('#').next().unwrap_or("");
+        let (key, value) = line.split_once('=')?;
+        Some((key.trim(), value.trim()))
     })
 }
 
-/// What a take costs, by `DisEnchantingStrategy.hasEnoughExperience`'s rules.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Charge {
-    /// Free: experience is not required, the cost is zero, or creative.
-    Nothing,
-    /// `Player.giveExperiencePoints(-cost)`.
-    Points(u32),
-    /// `Player.giveExperienceLevels(-cost)`.
-    Levels(u32),
-}
-
-/// The charge a take at the player's side needs. Creative is free because
-/// vanilla's `hasEnoughExperience` answers true there and the engine clamps the
-/// points at 0.
-#[must_use]
-pub fn charge(settings: Settings, creative: bool) -> Charge {
-    if creative || !settings.requires_experience || settings.experience_cost == 0 {
-        return Charge::Nothing;
-    }
-    if settings.uses_points {
-        Charge::Points(settings.experience_cost)
-    } else {
-        Charge::Levels(settings.experience_cost)
+fn boolean(value: &str) -> Option<bool> {
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
     }
 }
 
-/// `Player.getXpNeededForNextLevel`: the points from `level` to `level + 1`.
-#[must_use]
-pub fn points_to_next_level(level: u32) -> u32 {
-    if level < 15 {
-        7 + level * 2
-    } else if level < 30 {
+/// A TOML integer that fits an `i32` (upstream's `Math.toIntExact`), `_` separators allowed.
+fn int(value: &str) -> Option<i32> {
+    value.replace('_', "").parse().ok()
+}
+
+impl ServerSettings {
+    pub fn parse(text: &str) -> Self {
+        let mut s = Self::default();
+        for (key, value) in pairs(text) {
+            match key {
+                "automatic_disenchanting" => set(&mut s.automatic_disenchanting, boolean(value)),
+                "automatic_disenchanting_ticks" => {
+                    set(&mut s.automatic_disenchanting_ticks, int(value))
+                }
+                "resets_repair_cost" => set(&mut s.resets_repair_cost, boolean(value)),
+                "requires_experience" => set(&mut s.requires_experience, boolean(value)),
+                "uses_points" => set(&mut s.uses_points, boolean(value)),
+                "experience_cost" => set(&mut s.experience_cost, int(value)),
+                _ => {}
+            }
+        }
+        s
+    }
+
+    /// The experience a dis-enchant costs, as one signed number: 0 when it costs nothing, the
+    /// points when positive, the levels when negative.
+    pub fn rule(&self) -> i64 {
+        if !self.requires_experience || self.experience_cost <= 0 {
+            return 0;
+        }
+        let cost = i64::from(self.experience_cost);
+        if self.uses_points { cost } else { -cost }
+    }
+
+    /// [`Self::rule`] as the menu's data slot 1 sends it to the screen. A data slot holds 16 bits,
+    /// so a larger cost is clamped there, which only changes what the screen predicts: the server
+    /// checks the real cost.
+    pub fn cost_rule(&self) -> i32 {
+        self.rule().clamp(-i64::from(i16::MAX), i64::from(i16::MAX)) as i32
+    }
+}
+
+impl ClientSettings {
+    pub fn parse(text: &str) -> Self {
+        let mut s = Self::default();
+        for (key, value) in pairs(text) {
+            match key {
+                "render_block_particles" => set(&mut s.render_block_particles, boolean(value)),
+                "render_experience_cost" => set(&mut s.render_experience_cost, boolean(value)),
+                "render_table_item" => set(&mut s.render_table_item, boolean(value)),
+                _ => {}
+            }
+        }
+        s
+    }
+}
+
+fn set<T>(field: &mut T, value: Option<T>) {
+    if let Some(value) = value {
+        *field = value;
+    }
+}
+
+// ---- experience -------------------------------------------------------------------------------
+
+/// `Player.getXpNeededForNextLevel` at `level`.
+pub fn xp_needed_for_next_level(level: i32) -> i64 {
+    let level = i64::from(level);
+    if level >= 30 {
+        112 + (level - 30) * 9
+    } else if level >= 15 {
         37 + (level - 15) * 5
     } else {
-        112 + (level - 30) * 9
+        7 + level * 2
     }
 }
 
-/// The points a player has banked once they reach `level` with no progress.
-#[must_use]
-pub fn points_at_level(level: u32) -> u64 {
-    (0..level)
-        .map(|each| u64::from(points_to_next_level(each)))
-        .sum()
+/// The points it takes to climb from level 0 to `level`: the sum of
+/// [`xp_needed_for_next_level`] below it, in closed form.
+fn points_to_reach(level: i32) -> i64 {
+    let l = i64::from(level.max(0));
+    // Sum of 7 + 2k for k in 0..min(l, 15).
+    let low = l.min(15);
+    let mut total = 7 * low + low * (low - 1);
+    if l > 15 {
+        // Sum of 37 + 5(k - 15) for k in 15..min(l, 30).
+        let n = l.min(30) - 15;
+        total += 37 * n + 5 * n * (n - 1) / 2;
+    }
+    if l > 30 {
+        // Sum of 112 + 9(k - 30) for k in 30..l.
+        let n = l - 30;
+        total += 112 * n + 9 * n * (n - 1) / 2;
+    }
+    total
 }
 
-/// A player's total points from their own `experienceLevel` and
-/// `experienceProgress` (`ExperienceHelper.getTotalPlayerExperiencePoints`,
-/// with vanilla's thresholds).
-#[must_use]
-pub fn total_points(level: i32, progress: f32) -> u64 {
-    let level = u32::try_from(level).unwrap_or(0);
-    let next = u64::from(points_to_next_level(level));
-    let extra = (f64::from(progress.clamp(0.0, 1.0)) * next as f64).round() as u64;
-    points_at_level(level) + extra
+/// The points a player holds at `level` with `progress` towards the next: the levels' worth plus
+/// the bar's (`floor(progress * needed)`, as `/xp query points` counts it). Upstream sums the
+/// levels with an integer division that undercounts; this is the game's own count.
+pub fn total_points(level: i32, progress: f32) -> i64 {
+    let bar = (f64::from(progress) * xp_needed_for_next_level(level) as f64).floor() as i64;
+    points_to_reach(level) + bar
 }
 
-/// The level and progress `points` buys (`ExperienceHelper.getLevelFromExperiencePoints`,
-/// with vanilla's thresholds).
-#[must_use]
-pub fn level_after_points(points: u64) -> (u32, f32) {
-    let mut level = 0_u32;
-    let mut rest = points;
-    loop {
-        let next = u64::from(points_to_next_level(level));
-        if rest < next {
-            return (level, rest as f32 / next as f32);
+/// Whether a player at `level` with `progress` towards the next meets cost `rule` ([`ServerSettings::rule`]):
+/// the experience check of `DisEnchantingStrategy.hasEnoughExperience` after its creative checks.
+pub fn rule_met(rule: i64, level: i32, progress: f32) -> bool {
+    match rule {
+        0 => true,
+        points if points > 0 => total_points(level, progress) >= points,
+        levels => i64::from(level) >= -levels,
+    }
+}
+
+/// [`rule_met`] for the server's own settings.
+pub fn has_enough(settings: &ServerSettings, level: i32, progress: f32) -> bool {
+    rule_met(settings.rule(), level, progress)
+}
+
+// ---- dis-enchanting ---------------------------------------------------------------------------
+
+/// One enchantment: its namespaced id and its level.
+pub type Level = (String, u32);
+
+/// What a dis-enchant makes of an input's enchantments (`createResult` and `onTake`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Plan {
+    /// Any item but an enchanted book: every enchantment moves to a new enchanted book, and the
+    /// item keeps none.
+    Whole { moved: Vec<Level> },
+    /// An enchanted book with two or more: its first enchantment goes to a new book, and the input
+    /// becomes a new enchanted book with the rest.
+    Split { kept: Level, rest: Vec<Level> },
+}
+
+/// `DisEnchantingHelper.canDisenchant` and the plan for it: an item with enchantments, or an
+/// enchanted book with at least two. `enchantments` are the ones `getEnchantmentsForCrafting`
+/// reads (a book's stored ones, any other item's own), in the stack's order.
+pub fn plan(is_enchanted_book: bool, enchantments: &[Level]) -> Option<Plan> {
+    if !is_enchanted_book {
+        return (!enchantments.is_empty()).then(|| Plan::Whole {
+            moved: enchantments.to_vec(),
+        });
+    }
+    let (kept, rest) = enchantments.split_first()?;
+    (!rest.is_empty()).then(|| Plan::Split {
+        kept: kept.clone(),
+        rest: rest.to_vec(),
+    })
+}
+
+impl Plan {
+    /// The result slot's stack, as the enchantments of a new enchanted book.
+    pub fn result(&self) -> &[Level] {
+        match self {
+            Self::Whole { moved } => moved,
+            Self::Split { kept, .. } => std::slice::from_ref(kept),
         }
-        rest -= next;
-        level += 1;
     }
 }
 
-/// Whether the player's own `experienceLevel` / `experienceProgress` pay
-/// `charge`.
-#[must_use]
-pub fn affordable(charge: Charge, xp_level: i32, xp_progress: f32) -> bool {
-    match charge {
-        Charge::Nothing => true,
-        Charge::Points(cost) => total_points(xp_level, xp_progress) >= u64::from(cost),
-        Charge::Levels(cost) => u32::try_from(xp_level).unwrap_or(0) >= cost,
+// ---- particles --------------------------------------------------------------------------------
+
+/// One portal particle of `animateTick`, from the four random draws it makes, in order: two
+/// `nextInt(2)` and four `nextFloat` (`y`, then the three speeds). Position and velocity.
+pub fn portal_particle(
+    pos: [i32; 3],
+    x_side: i32,
+    z_side: i32,
+    floats: [f32; 4],
+) -> ([f64; 3], [f64; 3]) {
+    let x_mod = f64::from(x_side * 2 - 1);
+    let z_mod = f64::from(z_side * 2 - 1);
+    let at = [
+        f64::from(pos[0]) + 0.5 + 0.25 * x_mod,
+        f64::from(pos[1] as f32 + floats[0]),
+        f64::from(pos[2]) + 0.5 + 0.25 * z_mod,
+    ];
+    let velocity = [
+        f64::from(floats[1] * x_mod as f32),
+        (f64::from(floats[2]) - 0.5) * 0.125,
+        f64::from(floats[3] * z_mod as f32),
+    ];
+    (at, velocity)
+}
+
+/// The renderer's turn about the vertical axis for a table facing `facing` (2D data value: 0
+/// south, 1 west, 2 north, 3 east): north and south use the opposite side's `toYRot`, east and
+/// west their own, as upstream's renderer does.
+pub fn item_yaw(facing: &str) -> f32 {
+    match facing {
+        // Opposite of north is south (0), of south is north (180).
+        "north" => 0.0,
+        "south" => 180.0,
+        "east" => 270.0,
+        "west" => 90.0,
+        _ => 0.0,
     }
 }
 
-/// [`affordable`] once `reserved` points are already promised to earlier
-/// transactions of the same tick: the bar has not moved yet, so the second
-/// check sees the same balance the first one passed on.
-#[must_use]
-pub fn affordable_with(charge: Charge, xp_level: i32, xp_progress: f32, reserved: u64) -> bool {
-    match charge {
-        Charge::Nothing => true,
-        Charge::Points(cost) => {
-            total_points(xp_level, xp_progress).saturating_sub(reserved) >= u64::from(cost)
-        }
-        Charge::Levels(_) => affordable(charge, xp_level, xp_progress) && reserved == 0,
-    }
-}
-
-/// `Slot.mayPlace` for this mod's menu (`native_menu_slot_rules`): the input
-/// takes only an item that may be dis-enchanted, the extra slot only a book,
-/// the output nothing. Another mod's menu is left alone.
-pub fn slot_rule(
-    menu: &str,
-    slot: usize,
-    item: &str,
-    enchantments: &[(&str, u32)],
-    may_place: &mut bool,
-    _max_stack: &mut u32,
-) {
-    if menu != TABLE_MENU {
-        return;
-    }
-    match slot {
-        INPUT_SLOT => *may_place = can_disenchant(item, enchantments),
-        BOOK_SLOT => *may_place = is_book(item),
-        OUTPUT_SLOT => *may_place = false,
-        _ => {}
-    }
+/// The renderer's model seed for the table at `pos`: `(int) BlockPos.asLong()`, the low 32 bits of
+/// its packed position (26 bits of x, 26 of z, 12 of y).
+pub fn pos_seed(pos: [i32; 3]) -> i32 {
+    let packed = ((i64::from(pos[0]) & 0x3FF_FFFF) << 38)
+        | ((i64::from(pos[2]) & 0x3FF_FFFF) << 12)
+        | (i64::from(pos[1]) & 0xFFF);
+    packed as i32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const SHARPNESS: &str = "minecraft:sharpness";
-    const UNBREAKING: &str = "minecraft:unbreaking";
-
-    #[test]
-    fn only_an_item_with_enchantments_may_be_disenchanted() {
-        assert!(!can_disenchant("minecraft:diamond_sword", &[]));
-        assert!(can_disenchant("minecraft:diamond_sword", &[(SHARPNESS, 3)]));
-        assert!(can_disenchant("minecraft:stick", &[(SHARPNESS, 1)]));
+    fn lv(id: &str, level: u32) -> Level {
+        (id.to_owned(), level)
     }
 
     #[test]
-    fn an_enchanted_book_needs_two_enchantments() {
-        // Upstream refuses a one-enchantment book: nothing would be left.
-        assert!(!can_disenchant(ENCHANTED_BOOK_ITEM, &[(SHARPNESS, 3)]));
-        assert!(!can_disenchant(ENCHANTED_BOOK_ITEM, &[]));
-        assert!(can_disenchant(
-            ENCHANTED_BOOK_ITEM,
-            &[(SHARPNESS, 3), (UNBREAKING, 2)]
-        ));
-    }
-
-    #[test]
-    fn an_item_gives_the_output_every_enchantment_and_keeps_none() {
-        let plan = plan(
-            "minecraft:diamond_sword",
-            &[(SHARPNESS, 3), (UNBREAKING, 2)],
+    fn default_files_parse_to_the_defaults() {
+        assert_eq!(
+            ServerSettings::parse(DEFAULT_SERVER),
+            ServerSettings::default()
         );
         assert_eq!(
-            plan,
+            ClientSettings::parse(DEFAULT_CLIENT),
+            ClientSettings::default()
+        );
+    }
+
+    #[test]
+    fn settings_read_values_and_keep_defaults_for_bad_ones() {
+        let s = ServerSettings::parse(
+            "automatic_disenchanting = true # on\nexperience_cost = 3_0\nuses_points=false\nrequires_experience = \"no\"\nautomatic_disenchanting_ticks = 99999999999\n",
+        );
+        assert!(s.automatic_disenchanting);
+        assert_eq!(s.experience_cost, 30);
+        assert!(!s.uses_points);
+        assert!(s.requires_experience);
+        assert_eq!(s.automatic_disenchanting_ticks, 10);
+        let c = ClientSettings::parse("render_table_item = false\n");
+        assert!(!c.render_table_item && c.render_block_particles);
+    }
+
+    #[test]
+    fn cost_rule_signs_points_and_levels() {
+        let mut s = ServerSettings::default();
+        assert_eq!(s.cost_rule(), 25);
+        s.uses_points = false;
+        assert_eq!(s.cost_rule(), -25);
+        s.experience_cost = 1_000_000;
+        assert_eq!(s.cost_rule(), -32767);
+        s.requires_experience = false;
+        assert_eq!(s.cost_rule(), 0);
+    }
+
+    #[test]
+    fn points_match_summing_each_level() {
+        let mut sum = 0;
+        for level in 0..100 {
+            assert_eq!(points_to_reach(level), sum, "level {level}");
+            sum += xp_needed_for_next_level(level);
+        }
+        // Known values: level 16 is 352 points, level 31 is 1507, level 30 is 1395.
+        assert_eq!(total_points(16, 0.0), 352);
+        assert_eq!(total_points(30, 0.0), 1395);
+        assert_eq!(total_points(31, 0.0), 1507);
+        // Half of level 1's 9-point bar.
+        assert_eq!(total_points(1, 0.5), 7 + 4);
+    }
+
+    #[test]
+    fn enough_experience_by_points_and_levels() {
+        let mut s = ServerSettings::default();
+        // 25 points: level 2 holds 16, level 3 holds 27.
+        assert!(!has_enough(&s, 2, 0.0));
+        assert!(has_enough(&s, 3, 0.0));
+        assert!(has_enough(&s, 2, 0.9));
+        s.uses_points = false;
+        assert!(!has_enough(&s, 24, 0.99));
+        assert!(has_enough(&s, 25, 0.0));
+        s.experience_cost = 0;
+        assert!(has_enough(&s, 0, 0.0));
+        s.experience_cost = 25;
+        s.requires_experience = false;
+        assert!(has_enough(&s, 0, 0.0));
+    }
+
+    #[test]
+    fn items_move_everything_and_books_split_off_the_first() {
+        assert_eq!(plan(false, &[]), None);
+        assert_eq!(
+            plan(
+                false,
+                &[lv("minecraft:sharpness", 5), lv("minecraft:unbreaking", 3)]
+            ),
             Some(Plan::Whole {
-                moved: vec![(SHARPNESS.to_owned(), 3), (UNBREAKING.to_owned(), 2)],
+                moved: vec![lv("minecraft:sharpness", 5), lv("minecraft:unbreaking", 3)]
             })
         );
-    }
-
-    #[test]
-    fn a_book_keeps_its_first_enchantment_and_gives_the_rest() {
-        let plan = plan(
-            ENCHANTED_BOOK_ITEM,
-            &[(SHARPNESS, 3), (UNBREAKING, 2), ("minecraft:mending", 1)],
-        );
+        assert_eq!(plan(true, &[lv("minecraft:mending", 1)]), None);
+        let split = plan(
+            true,
+            &[
+                lv("minecraft:mending", 1),
+                lv("minecraft:protection", 4),
+                lv("minecraft:unbreaking", 3),
+            ],
+        )
+        .unwrap();
+        assert_eq!(split.result(), &[lv("minecraft:mending", 1)]);
         assert_eq!(
-            plan,
-            Some(Plan::Split {
-                kept: (SHARPNESS.to_owned(), 3),
-                moved: vec![
-                    (UNBREAKING.to_owned(), 2),
-                    ("minecraft:mending".to_owned(), 1)
-                ],
-            })
+            split,
+            Plan::Split {
+                kept: lv("minecraft:mending", 1),
+                rest: vec![lv("minecraft:protection", 4), lv("minecraft:unbreaking", 3)],
+            }
         );
     }
 
     #[test]
-    fn an_ineligible_input_has_no_plan() {
-        assert_eq!(plan("minecraft:diamond_sword", &[]), None);
-        assert_eq!(plan(ENCHANTED_BOOK_ITEM, &[(SHARPNESS, 1)]), None);
+    fn particles_spread_to_the_four_corners() {
+        let (at, v) = portal_particle([10, 64, -3], 0, 1, [0.5, 0.25, 0.0, 1.0]);
+        assert_eq!(at, [10.25, 64.5, -2.25]);
+        assert_eq!(v, [-0.25, -0.0625, 1.0]);
     }
 
     #[test]
-    fn a_second_take_in_one_tick_cannot_spend_the_same_points_twice() {
-        // Level 5 with no progress banks 55 points; two 25-point takes pass on
-        // the unchanged bar, so the second must see the first's promise.
-        let (level, progress) = (5, 0.0);
-        let banked = total_points(level, progress);
-        let cost = Charge::Points(25);
-        assert!(affordable(cost, level, progress), "the first take is paid");
-        // 24 points left after an earlier take's promise: the second 25-point
-        // take must be refused on the unchanged bar.
-        let promised = banked - 24;
-        assert!(
-            !affordable_with(cost, level, progress, promised),
-            "{} of {} points are already promised",
-            promised,
-            banked
-        );
-        assert!(
-            affordable_with(cost, level, progress, promised - 1),
-            "one point more left pays the take"
-        );
-        assert!(
-            affordable_with(cost, level, progress, 0),
-            "nothing promised: the same bar pays once"
-        );
-        assert!(
-            !affordable_with(cost, level, progress, banked),
-            "a promise of the whole balance leaves nothing"
-        );
+    fn seed_is_the_packed_position() {
+        assert_eq!(pos_seed([0, 0, 0]), 0);
+        assert_eq!(pos_seed([0, 64, 0]), 64);
+        assert_eq!(pos_seed([0, -1, 0]), 0xFFF);
+        assert_eq!(pos_seed([0, 0, 1]), 1 << 12);
+        // x lands above bit 38 and leaves the low 32 bits alone.
+        assert_eq!(pos_seed([5, 0, 0]), 0);
+        assert_eq!(pos_seed([0, 0, -1]), (0x3FF_FFFFi64 << 12) as i32);
     }
 
     #[test]
-    fn the_default_cost_is_twenty_five_points() {
-        assert_eq!(charge(DEFAULT_SETTINGS, false), Charge::Points(25));
-    }
-
-    #[test]
-    fn a_creative_player_pays_nothing() {
-        // Upstream's `hasEnoughExperience` is always true in creative, and the
-        // engine clamps the points at 0, so the take is free there.
-        assert_eq!(charge(DEFAULT_SETTINGS, true), Charge::Nothing);
-    }
-
-    #[test]
-    fn experience_can_be_switched_off_or_charged_in_levels() {
-        let free = Settings {
-            requires_experience: false,
-            ..DEFAULT_SETTINGS
-        };
-        assert_eq!(charge(free, false), Charge::Nothing);
-        let levels = Settings {
-            uses_points: false,
-            ..DEFAULT_SETTINGS
-        };
-        assert_eq!(charge(levels, false), Charge::Levels(25));
-    }
-
-    #[test]
-    fn vanilla_level_thresholds_are_cumulative() {
-        assert_eq!(points_to_next_level(0), 7);
-        assert_eq!(points_to_next_level(14), 35);
-        assert_eq!(points_to_next_level(15), 37);
-        assert_eq!(points_to_next_level(29), 107);
-        assert_eq!(points_to_next_level(30), 112);
-        assert_eq!(points_at_level(0), 0);
-        assert_eq!(points_at_level(1), 7);
-        assert_eq!(points_at_level(9), 135);
-        assert_eq!(points_at_level(15), 315);
-        assert_eq!(points_at_level(16), 352);
-        assert_eq!(points_at_level(30), 1395);
-    }
-
-    #[test]
-    fn a_players_points_round_trip_through_the_level() {
-        assert_eq!(total_points(0, 0.0), 0);
-        assert_eq!(total_points(9, 0.0), 135);
-        // 0.6 of the first level's 7 points is 4 points, rounded.
-        assert_eq!(total_points(0, 0.6), 4);
-        // 110 points is level 7 with 19 of its 21 points.
-        let (level, progress) = level_after_points(110);
-        assert_eq!(level, 7);
-        assert_eq!(total_points(level as i32, progress), 110);
-    }
-
-    #[test]
-    fn affordability_follows_points_or_levels() {
-        let points = Charge::Points(25);
-        assert!(affordable(points, 9, 0.0));
-        assert!(!affordable(points, 0, 0.0));
-        // 27 points at level 3, 16 at level 2.
-        assert!(affordable(points, 3, 0.0));
-        assert!(!affordable(points, 2, 0.0));
-        assert!(affordable(Charge::Nothing, 0, 0.0));
-        assert!(!affordable(Charge::Levels(25), 24, 0.9));
-        assert!(affordable(Charge::Levels(25), 25, 0.0));
-        // A negative level (a broken save) reads as zero.
-        assert!(!affordable(points, -3, 0.0));
-        assert!(!affordable(Charge::Levels(1), -3, 0.0));
-    }
-
-    #[test]
-    fn the_input_slot_takes_only_something_worth_disenchanting() {
-        let mut may_place = true;
-        let mut max_stack = 99;
-        slot_rule(
-            TABLE_MENU,
-            INPUT_SLOT,
-            "minecraft:diamond_sword",
-            &[(SHARPNESS, 3)],
-            &mut may_place,
-            &mut max_stack,
-        );
-        assert!(may_place);
-        let mut may_place = true;
-        slot_rule(
-            TABLE_MENU,
-            INPUT_SLOT,
-            "minecraft:diamond_sword",
-            &[],
-            &mut may_place,
-            &mut max_stack,
-        );
-        assert!(!may_place);
-        // A one-enchantment book would leave nothing behind, so it is refused.
-        assert!(!can_disenchant(ENCHANTED_BOOK_ITEM, &[(SHARPNESS, 1)]));
-        assert_eq!(max_stack, 99);
-    }
-
-    #[test]
-    fn the_book_slot_takes_only_books() {
-        let mut may_place = true;
-        let mut max_stack = 99;
-        slot_rule(
-            TABLE_MENU,
-            BOOK_SLOT,
-            BOOK_ITEM,
-            &[],
-            &mut may_place,
-            &mut max_stack,
-        );
-        assert!(may_place);
-        let mut may_place = true;
-        slot_rule(
-            TABLE_MENU,
-            BOOK_SLOT,
-            "minecraft:writable_book",
-            &[],
-            &mut may_place,
-            &mut max_stack,
-        );
-        assert!(!may_place);
-    }
-
-    #[test]
-    fn the_output_slot_takes_nothing_and_another_menu_is_untouched() {
-        let mut may_place = true;
-        let mut max_stack = 99;
-        slot_rule(
-            TABLE_MENU,
-            OUTPUT_SLOT,
-            BOOK_ITEM,
-            &[],
-            &mut may_place,
-            &mut max_stack,
-        );
-        assert!(!may_place);
-        let mut may_place = true;
-        slot_rule(
-            "botanypots:basic_pot_menu",
-            INPUT_SLOT,
-            "minecraft:stick",
-            &[],
-            &mut may_place,
-            &mut max_stack,
-        );
-        assert!(may_place, "another mod's menu must be left alone");
-    }
-
-    #[test]
-    fn the_block_and_menu_ids_are_the_jar_s_own() {
-        assert!(is_table(TABLE_BLOCK));
-        assert!(!is_table("minecraft:enchanting_table"));
-        assert!(!is_table("disenchanting_table:something_else"));
+    fn item_faces_the_front() {
+        assert_eq!(item_yaw("north"), 0.0);
+        assert_eq!(item_yaw("south"), 180.0);
+        assert_eq!(item_yaw("east"), 270.0);
+        assert_eq!(item_yaw("west"), 90.0);
     }
 }

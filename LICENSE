@@ -1,8 +1,3 @@
-UNLICENSE (public domain dedication)
-
-Original mod: Dis-Enchanting Table by Lupin and Jason13, released under the
-Unlicense (the jar's `META-INF/neoforge.mods.toml` declares `license = "Unlicense"`).
-
 This is free and unencumbered software released into the public domain.
 
 Anyone is free to copy, modify, publish, use, compile, sell, or
@@ -26,6 +21,4 @@ OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
 ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 OTHER DEALINGS IN THE SOFTWARE.
 
-For more information, please refer to <https://unlicense.org>
-
-Port to Horizon by AdLf0208. Original: https://github.com/Mods-For-Lupin/Dis-Enchanting-Redux.
+For more information, please refer to <https://unlicense.org/>

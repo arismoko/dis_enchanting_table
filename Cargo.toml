@@ -1,19 +1,13 @@
 [package]
-# Port of Dis-Enchanting Table 5.0.2 (Mods-For-Lupin/Dis-Enchanting-Redux, Unlicense) to Horizon
-# 26.3 at the pin in horizon-mod.toml. Clean-room Rust rewrite from the mod's behaviour
-# (FINDINGS.md); local-only until publishing is approved, publishable under the Unlicense with
-# this complete source.
-#
-# Cargo's name and version are not the mod's identity: horizon-mod.toml is.
-name = "disenchanting_table"
-version = "0.2.0"
+name = "mod-disenchanting_table"
+version = "5.1.0"
 edition = "2024"
 license = "Unlicense"
-description = "Dis-Enchanting Table for Horizon, slice 1: the table"
+description = "Dis-Enchanting Table for Sunrise: move enchantments onto books"
+# Ported from: Dis-Enchanting Table 5.1.0 (Mods-For-Lupin/Dis-Enchanting-Redux, Unlicense), Minecraft Java 1.21.9.
+# The textures, models, lang, recipe, loot table and tags are the upstream mod's own files.
 publish = false
 
 [dependencies]
-# The pinned SDK's API crate, fetched into .horizon/sdk/ by any `cargo horizon-mod` command (the
-# launcher builds against its own copy of the same build). Any other registry dependency must be
-# pinned with `horizon-launcher native-lock .` before building.
-horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }
+# The pinned SDK's API crate, fetched into .sunrise/sdk/ by any `cargo sunrise-mod` command.
+sunrise-mod-api = { path = ".sunrise/sdk/api/crates/sunrise-mod-api" }

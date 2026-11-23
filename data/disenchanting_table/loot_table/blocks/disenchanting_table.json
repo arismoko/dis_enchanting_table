@@ -2,16 +2,26 @@
   "type": "minecraft:block",
   "pools": [
     {
-      "rolls": 1.0,
-      "entries": [
+      "bonus_rolls": 0.0,
+      "conditions": [
         {
-          "name": "disenchanting_table:disenchanting_table",
-          "type": "minecraft:item"
+          "condition": "minecraft:survives_explosion"
         }
       ],
-      "condition": {
-        "type": "minecraft:survives_explosion"
-      }
+      "entries": [
+        {
+          "type": "minecraft:item",
+          "functions": [
+            {
+              "function": "minecraft:copy_name",
+              "source": "block_entity"
+            }
+          ],
+          "name": "disenchanting_table:disenchanting_table"
+        }
+      ],
+      "rolls": 1.0
     }
-  ]
+  ],
+  "random_sequence": "disenchanting_table:blocks/disenchanting_table"
 }

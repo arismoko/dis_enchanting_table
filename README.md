@@ -1,61 +1,37 @@
-# Dis-Enchanting Table — a Horizon port
+# Dis-Enchanting Table for Sunrise
 
-**Dis-Enchanting Table** is a Minecraft mod. This repository is a **port of it to [Horizon](https://github.com/horizon-rust/horizon)**, the Rust engine for Minecraft Java 26.3. It carries the complete source of the port plus the content files it ships, and installs as a single `.hmod` package.
+A table that moves an item's enchantments onto a book, or splits an enchanted book in two.
 
-Upstream: [Mods-For-Lupin-OLD/Dis-Enchanting-Redux](https://github.com/Mods-For-Lupin-OLD/Dis-Enchanting-Redux) — licence **Unlicense**.
+A port of [Dis-Enchanting Table](https://github.com/Mods-For-Lupin/Dis-Enchanting-Redux) by Lupin and Jason13 to [Sunrise](https://playsunrise.net) (Minecraft Java 26.3).
 
-| | |
-|---|---|
-| Upstream mod | Dis-Enchanting Table ([source](https://github.com/Mods-For-Lupin-OLD/Dis-Enchanting-Redux)) |
-| Ported to | Horizon 0b14f8a, Minecraft Java 26.3, mod API `0.2` |
-| Package | `disenchanting_table.hmod` (install it with the Horizon launcher) |
-| Licence | **Unlicense** — the upstream mod's licence; see [Licence and credit](#licence-and-credit) |
+## What it does
 
-## What this port implements
+- A Dis-Enchanting Table block, crafted and broken as in the original, with its portal particles drifting out of the table.
+- Put an enchanted item and a book in the table and take an enchanted book holding all of the item's enchantments; the item keeps everything else and, by default, loses its anvil repair cost.
+- An enchanted book with more than one enchantment splits in two: its first enchantment moves to the new book and it keeps the rest.
+- Taking the book costs 25 experience points by default; a player without them sees "Insufficient Experience!" and can't take it. Creative players pay nothing.
+- Automatic mode (server setting): the table dis-enchants on its own every 10 ticks, charging the nearest player within 16 blocks, and hoppers can fill its input and book slots. The item being worked on lies on top of the table.
+- The original's server settings (`disenchanting_table-server.toml`: automatic mode and its speed, repair-cost reset, whether and how much experience it takes, points or levels) and client settings (`disenchanting_table-client.toml`: particles, the experience notice, the item on top).
+- The original's recipe, loot table, creative tab entry, models, textures and English, Japanese, Russian and Turkish translations.
 
-- Move an item's enchantments onto a book for 25 experience points at a Dis-Enchanting Table
+## Differences from the original
 
-## Not yet ported
+- In manual mode the table opens for one player at a time, and the items you put in are the table's own slots: closing the table gives them back (or drops them if your inventory is full), as the original does.
+- The result appears in the right-hand slot on the table's next tick rather than the moment you place the item.
+- The experience check counts your points exactly; the original's count could be off by a few points at some levels.
+- The item on top of the table and the automatic-mode setting now show the same on every player's screen in multiplayer.
+- Hoppers can't take the finished book out yet: that waits on a mod API addition (sunrise-org/sunrise#5014). They can fill the table.
 
-- **No in-game run at 0.2.0** (trap 14): `tools/e2e.sh` is written for a launcher build and
-- **The old `CONTROL=1` embedded-file leg is gone**: one package is the block, so the control is
-- **The points charge still reads the player by name** in the console line (`xp add <name> -25
-- the **config file** (`automatic_disenchanting`, `automatic_disenchanting_ticks`,
-- the **automatic mode** (a 10-tick auto-dis-enchant) and its data slot;
-- the **dis-enchant sound** and the block's portal particles
-- the **Fabric/Forge halves** of the merged jar (their `ClientConfig`,
-- **per-item `mayPlace` in the hopper path**: `native_container_accepts` is
+## Building
 
-## Installing
+With the Sunrise mod tool (`cargo sunrise-mod`, from the Sunrise SDK) and Rust:
 
-1. Install the [Horizon launcher](https://github.com/horizon-rust/horizon/releases) (0.2.70 or newer).
-2. Add `disenchanting_table.hmod` to the instance's mods.
-3. The package is pinned to a specific Horizon build; the launcher checks that pin.
-
-## Licence and credit
-
-Dis-Enchanting Table was created by its upstream authors; the code, models and assets in the original mod
-remain theirs and are used here under **Unlicense**. The Rust in this repository is a clean-room
-rewrite for Horizon, not a translation of the original source.
-
-- `LICENSE` — the upstream licence text.
-- `LICENSE-NOTICE.md` — what this port carries and where it came from.
-- The upstream project: https://github.com/Mods-For-Lupin-OLD/Dis-Enchanting-Redux
-
-## Technical details
-
-```
-horizon-mod.toml   package manifest (id, version, api, [native] pin)
-Cargo.toml         the crate; depends on `horizon-mod-api` from the fetched SDK
-src/               lib.rs (the one `impl Hooks`), runtime.rs (pure logic + tests), glue
-assets/ data/      the content the package ships
-tools/             content generators and the e2e scenario
+```sh
+cargo sunrise-mod build    # compiles against the pinned game, packs target/sunrise-mod/disenchanting_table.smod
+cargo sunrise-mod run      # builds it and starts the game with it
+cargo test
 ```
 
-- Build: `cargo horizon-mod build` (packages; it does not compile against the game).
-- Test: `cargo test`, `cargo clippy --all-targets -- -D warnings`.
-- In-game: `ports/tools/launcher-game.sh run disenchanting_table` in the campaign tree, or install the
-  `.hmod` and play; the harness scenario is `tools/e2e.sh`.
+## Licence
 
-This repository is generated from the campaign's port at `ports/disenchanting_table/`; the port's own
-`notes.md` is the full record (decisions, traps, evidence).
+Unlicense, as the original. See [LICENSE](LICENSE) and [LICENSE-NOTICE.md](LICENSE-NOTICE.md).
