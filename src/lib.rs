@@ -80,9 +80,9 @@ impl Hooks for Mod {
     fn register(&self, r: &mut dyn Registrar, _: &RegistrationContext) {
         let block: BlockKey = r.block_key(table::ID);
         let kind = r.block_entity_type(table::ID).blocks(&[table::ID]).build();
+        // A block entity Part also answers for its blocks, particles included.
         r.block_entity_part(&kind, table::Table)
             .expect("the table's block entity type is the mod's own");
-        r.block_part(block, table::Table);
         // Every face reaches every slot (`getSlotsForFace`): hoppers fill the input and the
         // book, and in automatic mode take from any slot (`Table::can_take_item_through_face`).
         r.block_container(
