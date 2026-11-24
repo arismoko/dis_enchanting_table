@@ -10,11 +10,12 @@ use crate::runtime::{self, Level, Plan, ServerSettings};
 use crate::{client_settings, keys, server_settings};
 use mod_api::{
     AnimateTickEvent, BlockEntityPart, BlockEntitySubmitEvent, BlockEntityTickEvent,
-    BlockEntityTicksEvent, BlockEntityUpdateTagEvent, BlockPart, CanPlaceItemEvent, ClientHost,
-    Component, Compound, DrawContext, Host, HostBlockStates, HostTransaction, ItemDisplayContext,
-    ItemStack, JavaString, LevelRef, MenuContainer, MenuPart, MenuScreen, MenuScreenFactory,
-    MenuScreenFrame, MenuScreenLayout, MenuScreenOpen, MenuSlotRulesEvent, MenuSlotTakeEvent,
-    ParticleOptions, PlayerRef, PreRemoveSideEffectsEvent, ScreenSlot, ServerHost, Tag,
+    BlockEntityTicksEvent, BlockEntityUpdateTagEvent, BlockPart, CanPlaceItemEvent,
+    CanTakeItemThroughFaceEvent, ClientHost, Component, Compound, DrawContext, Host,
+    HostBlockStates, HostTransaction, ItemDisplayContext, ItemStack, JavaString, LevelRef,
+    MenuContainer, MenuPart, MenuScreen, MenuScreenFactory, MenuScreenFrame, MenuScreenLayout,
+    MenuScreenOpen, MenuSlotRulesEvent, MenuSlotTakeEvent, ParticleOptions, PlayerRef,
+    PreRemoveSideEffectsEvent, ScreenSlot, ServerHost, Tag,
 };
 
 /// The table's menu type, its block entity type and its block: one id.
@@ -440,45 +441,15 @@ impl BlockEntityPart for Table {
         Some(allowed)
     }
 
-    /// Manual mode's `onTake`: the input loses what the result took, a book is used, the player
-    /// pays, and the table shows the next preview.
-    fn menu_slot_take(&self, event: &mut MenuSlotTakeEvent<'_>) {
-        let settings = server_settings();
-        if event.slot != OUTPUT as usize || settings.automatic_disenchanting {
-            return;
-        }
-        let scope = &mut event.subject;
-        let Some((level, pos, input, extra, was_preview)) = scope.with_view(|view| {
-            (
-                view.level(),
-                view.position(),
-                view.item_slot(INPUT).and_then(|s| s.to_owned()),
-                view.item_slot(BOOK).and_then(|s| s.to_owned()),
-                flag(view.nbt(), PREVIEW),
-            )
-        }) else {
-            return;
-        };
-        // A real item left from automatic mode is just taken.
-        let Some(plan) = was_preview.then(|| plan_of(input.as_ref())).flatten() else {
-            return;
-        };
-        let input = input.map(|i| stripped(&i, &plan, &settings));
-        let extra = extra.and_then(|b| b.shrink(1));
-        let next = preview(input.as_ref(), extra.as_ref());
-        scope.with_view(|mut view| {
-            let _ = view.set_item_slot(INPUT, input);
-            let _ = view.set_item_slot(BOOK, extra);
-            let _ = view.set_item_slot(OUTPUT, next.clone());
-            view.set_nbt(PREVIEW.into(), byte(next.is_some()));
-        });
-        let host = scope.host();
-        if let Some(player) = host.player(event.player) {
-            charge(host, player, &settings);
-        }
-        if client_settings().render_block_particles {
-            level.level_event(host, DISENCHANT_EVENT, pos, 0);
-        }
+    /// `canTakeItemThroughFace`: any slot in automatic mode, as upstream. Manual mode keeps the
+    /// open player's inputs and preview in the table, where upstream's menu held them, so
+    /// nothing leaves through a side.
+    fn can_take_item_through_face(
+        &self,
+        _: &dyn Host,
+        _: &mut CanTakeItemThroughFaceEvent<'_>,
+    ) -> Option<bool> {
+        Some(server_settings().automatic_disenchanting)
     }
 
     /// Breaking the table drops what it holds; in manual mode the preview is not an item.
@@ -559,6 +530,47 @@ pub(crate) struct TableMenu;
 
 #[mod_api::sunrise_part]
 impl MenuPart for TableMenu {
+    /// Manual mode's `onTake`: the input loses what the result took, a book is used, the player
+    /// pays, and the table shows the next preview.
+    fn menu_slot_take(&self, event: &mut MenuSlotTakeEvent<'_>) {
+        let settings = server_settings();
+        if event.slot != OUTPUT as usize || settings.automatic_disenchanting {
+            return;
+        }
+        let scope = &mut event.subject;
+        let Some((level, pos, input, extra, was_preview)) = scope.with_view(|view| {
+            (
+                view.level(),
+                view.position(),
+                view.item_slot(INPUT).and_then(|s| s.to_owned()),
+                view.item_slot(BOOK).and_then(|s| s.to_owned()),
+                flag(view.nbt(), PREVIEW),
+            )
+        }) else {
+            return;
+        };
+        // A real item left from automatic mode is just taken.
+        let Some(plan) = was_preview.then(|| plan_of(input.as_ref())).flatten() else {
+            return;
+        };
+        let input = input.map(|i| stripped(&i, &plan, &settings));
+        let extra = extra.and_then(|b| b.shrink(1));
+        let next = preview(input.as_ref(), extra.as_ref());
+        scope.with_view(|mut view| {
+            let _ = view.set_item_slot(INPUT, input);
+            let _ = view.set_item_slot(BOOK, extra);
+            let _ = view.set_item_slot(OUTPUT, next.clone());
+            view.set_nbt(PREVIEW.into(), byte(next.is_some()));
+        });
+        let host = scope.host();
+        if let Some(player) = host.player(event.player) {
+            charge(host, player, &settings);
+        }
+        if client_settings().render_block_particles {
+            level.level_event(host, DISENCHANT_EVENT, pos, 0);
+        }
+    }
+
     /// The slots' rules, the same in both modes: slot 0 takes what can be dis-enchanted, slot 1
     /// books, slot 2 nothing. In manual mode the preview is taken only by a player with the
     /// experience for it, and only while the inputs still make it.

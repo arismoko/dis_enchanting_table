@@ -83,14 +83,15 @@ impl Hooks for Mod {
         r.block_entity_part(&kind, table::Table)
             .expect("the table's block entity type is the mod's own");
         r.block_part(block, table::Table);
-        // Hoppers fill the input and the book from any side; taking out waits on
-        // sunrise-org/sunrise#5014.
+        // Every face reaches every slot (`getSlotsForFace`): hoppers fill the input and the
+        // book, and in automatic mode take from any slot (`Table::can_take_item_through_face`).
         r.block_container(
             &block,
             ModContainer {
                 slots: 3,
-                faces: std::array::from_fn(|_| vec![0, 1]),
+                faces: std::array::from_fn(|_| vec![0, 1, 2]),
                 inputs: vec![0, 1],
+                outputs: vec![0, 1, 2],
                 menu: Some(table::ID.to_owned()),
                 ..Default::default()
             },
