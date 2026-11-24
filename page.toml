@@ -21,3 +21,7 @@ Differences from the original:
 - The item on top of the table and the automatic-mode setting now show the same on every player's screen in multiplayer.
 """
 categories = ["utility", "game-mechanics"]
+
+[[screenshots]]
+path = "page/page-table.png"
+caption = "The Dis-Enchanting Table taking the enchantments off a sword."

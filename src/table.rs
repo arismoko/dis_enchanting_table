@@ -165,7 +165,8 @@ fn has_enough(host: &dyn Host, player: PlayerRef, settings: &ServerSettings) -> 
 
 /// Takes a dis-enchant's cost from `player`, when the server asks for one and the player has it.
 /// Points go through `/xp add`, which takes a negative amount: the API's point grant takes only
-/// positive ones (sunrise-org/sunrise#5013).
+/// positive ones (sunrise-org/sunrise#5013). The command's player argument refuses a UUID, as
+/// vanilla's does, so it runs as the player and names `@s`.
 fn charge(host: &mut dyn ServerHost, player: PlayerRef, settings: &ServerSettings) {
     if !settings.requires_experience || !has_enough(&*host, player, settings) {
         return;
@@ -181,8 +182,10 @@ fn charge(host: &mut dyn ServerHost, player: PlayerRef, settings: &ServerSetting
             (uuid >> 48) & 0xFFFF,
             uuid & 0xFFFF_FFFF_FFFF
         );
-        host.commands()
-            .run_command(&format!("xp add {uuid} {} points", -i64::from(cost)));
+        host.commands().run_command(&format!(
+            "execute as {uuid} run xp add @s {} points",
+            -i64::from(cost)
+        ));
     } else {
         player.give_levels(host, -cost);
     }
