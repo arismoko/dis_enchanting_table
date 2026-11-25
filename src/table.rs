@@ -10,12 +10,12 @@ use crate::runtime::{self, Level, Plan, ServerSettings};
 use crate::{client_settings, keys, server_settings};
 use mod_api::{
     AnimateTickEvent, BlockEntityPart, BlockEntitySubmitEvent, BlockEntityTickEvent,
-    BlockEntityTicksEvent, BlockEntityUpdateTagEvent, BlockPart, CanPlaceItemEvent,
-    CanTakeItemThroughFaceEvent, ClientHost, Component, Compound, DrawContext, Host,
-    HostBlockStates, HostTransaction, ItemDisplayContext, ItemStack, JavaString, LevelRef,
-    MenuContainer, MenuPart, MenuScreen, MenuScreenFactory, MenuScreenFrame, MenuScreenLayout,
-    MenuScreenOpen, MenuSlotRulesEvent, MenuSlotTakeEvent, ParticleOptions, PlayerRef,
-    PreRemoveSideEffectsEvent, ScreenSlot, ServerHost, Tag,
+    BlockEntityUpdateTagEvent, BlockPart, CanPlaceItemEvent, CanTakeItemThroughFaceEvent,
+    ClientHost, Component, Compound, DrawContext, Host, HostBlockStates, HostTransaction,
+    ItemDisplayContext, ItemStack, JavaString, LevelRef, MenuContainer, MenuPart, MenuScreen,
+    MenuScreenFactory, MenuScreenFrame, MenuScreenLayout, MenuScreenOpen, MenuSlotRulesEvent,
+    MenuSlotTakeEvent, ParticleOptions, PlayerRef, PreRemoveSideEffectsEvent, ScreenSlot,
+    ServerHost, Tag,
 };
 
 /// The table's menu type, its block entity type and its block: one id.
@@ -227,7 +227,7 @@ fn nearest_player(host: &dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> Opti
 fn tick(event: &mut BlockEntityTickEvent<'_>) {
     let settings = server_settings();
     let scope = &mut event.subject;
-    let Some((level, pos, items, nbt, data)) = scope.with_view(|view| {
+    let Some((level, pos, items, nbt, data, handle)) = scope.with_view(|view| {
         let items: [Option<ItemStack>; 3] =
             std::array::from_fn(|i| view.item_slot(i as u32).and_then(|s| s.to_owned()));
         (
@@ -236,6 +236,7 @@ fn tick(event: &mut BlockEntityTickEvent<'_>) {
             items,
             view.nbt().clone(),
             view.data_slots().to_vec(),
+            view.handle(),
         )
     }) else {
         return;
@@ -329,7 +330,7 @@ fn tick(event: &mut BlockEntityTickEvent<'_>) {
         }
     });
     if sync {
-        scope.host().block_entity_sync(pos);
+        let _ = handle.sync(scope.host());
     }
 }
 
@@ -425,10 +426,6 @@ impl BlockPart for Table {
 
 #[mod_api::sunrise_part]
 impl BlockEntityPart for Table {
-    fn block_entity_ticks(&self, _: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
-        event.ticks = true;
-    }
-
     fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
         tick(event);
     }
@@ -461,13 +458,11 @@ impl BlockEntityPart for Table {
         _: &mut dyn mod_api::LevelRandomHost,
         event: &mut PreRemoveSideEffectsEvent<'_>,
     ) {
-        if flag(&event.entity.nbt, PREVIEW) {
-            event.keep_contents = true;
-            let items = &event.entity.items;
+        if flag(event.entity.nbt(), PREVIEW) {
+            event.effects.set_keep_contents(true);
             for slot in [INPUT, BOOK] {
-                event
-                    .drops
-                    .push(items.get(slot as usize).cloned().flatten());
+                // A refused stack is skipped; the other slot still drops.
+                let _ = event.effects.drop_slot(event.entity.copy_item_slot(slot));
             }
         }
     }
@@ -479,7 +474,7 @@ impl BlockEntityPart for Table {
     ) -> Option<Compound> {
         let mut tag = Compound::new();
         for key in [AUTOMATIC, SHOWN] {
-            if let Some(value) = event.entity.nbt.get(&JavaString::from(key)) {
+            if let Some(value) = event.entity.nbt().get(&JavaString::from(key)) {
                 tag.insert(key.into(), value.clone());
             }
         }
@@ -492,7 +487,7 @@ impl BlockEntityPart for Table {
         if !client_settings().render_table_item {
             return;
         }
-        let nbt = &event.entity.nbt;
+        let nbt = event.entity.nbt();
         let stack = if flag(nbt, AUTOMATIC) {
             match nbt.get(&JavaString::from(SHOWN)) {
                 Some(Tag::Compound(shown)) => ItemStack::from_nbt(host, shown),
