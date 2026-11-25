@@ -6,15 +6,14 @@ mod runtime;
 mod table;
 
 use mod_api::{
-    Block, BlockEntityTypeKey, BlockKey, BlockProperties, BlockShapes, BlocksEvent,
-    Config as ModConfig, ConfigContext, ConfigKind, ConfigLoadingEvent, ConfigReloadingEvent, Flow,
-    Hooks, HostSide, InteractionResult, ItemKey, ModContainer, NoteInstrument, ParticleKey,
-    PlayerContainerCloseEvent, RegisterConfigsEvent, Registrar, RegistrationContext,
-    RightClickBlockEvent, ServerHost,
+    Block, BlockEntityTypeKey, BlockKey, BlockProperties, BlockShapes, BlocksEvent, ConfigEvent,
+    ConfigKind, ConfigSnapshot, ConfigSpec, Flow, Hooks, HostSide, InteractionResult, ItemKey,
+    ModContainer, NoteInstrument, ParticleKey, PlayerContainerCloseEvent, Registrar,
+    RegistrationContext, RightClickBlockEvent, ServerHost,
 };
 use runtime::{ClientSettings, ServerSettings};
 use std::collections::BTreeMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const MOD: &str = "disenchanting_table";
 
@@ -57,19 +56,22 @@ pub(crate) fn client_settings() -> ClientSettings {
     *CLIENT.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn apply(mod_id: &str, kind: ConfigKind, text: &str) {
-    if mod_id != MOD {
-        return;
-    }
-    match kind {
-        ConfigKind::Server => {
-            *SERVER.lock().unwrap_or_else(|e| e.into_inner()) = ServerSettings::parse(text)
+/// The one listener of both config files: each registration's snapshot names its own kind.
+fn config_listener(event: ConfigEvent<'_>, snapshot: &ConfigSnapshot) -> Result<(), String> {
+    if matches!(event, ConfigEvent::Loading(_) | ConfigEvent::Reloading(_)) {
+        match snapshot.kind {
+            ConfigKind::Server => {
+                *SERVER.lock().unwrap_or_else(|e| e.into_inner()) =
+                    ServerSettings::parse(&snapshot.text)
+            }
+            ConfigKind::Client => {
+                *CLIENT.lock().unwrap_or_else(|e| e.into_inner()) =
+                    ClientSettings::parse(&snapshot.text)
+            }
+            _ => {}
         }
-        ConfigKind::Client => {
-            *CLIENT.lock().unwrap_or_else(|e| e.into_inner()) = ClientSettings::parse(text)
-        }
-        _ => {}
     }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -78,6 +80,17 @@ struct Mod;
 #[mod_api::sunrise_mod]
 impl Hooks for Mod {
     fn register(&self, r: &mut dyn Registrar, _: &RegistrationContext) {
+        for (kind, default) in [
+            (ConfigKind::Server, runtime::DEFAULT_SERVER),
+            (ConfigKind::Client, runtime::DEFAULT_CLIENT),
+        ] {
+            if let Err(err) = r.register_config(
+                ConfigSpec::new(kind, default),
+                Some(Arc::new(config_listener)),
+            ) {
+                eprintln!("{MOD}: config registration failed: {err}");
+            }
+        }
         let block: BlockKey = r.block_key(table::ID);
         let kind = r.block_entity_type(table::ID).blocks(&[table::ID]).build();
         // A block entity Part also answers for its blocks, particles included.
@@ -134,35 +147,6 @@ impl Hooks for Mod {
         let _ = event.register(block);
     }
 
-    fn register_configs(&self, _: &dyn ConfigContext, event: &mut RegisterConfigsEvent<'_>) {
-        event.configs.push(ModConfig::new(
-            MOD,
-            ConfigKind::Server,
-            runtime::DEFAULT_SERVER,
-        ));
-        event.configs.push(ModConfig::new(
-            MOD,
-            ConfigKind::Client,
-            runtime::DEFAULT_CLIENT,
-        ));
-    }
-
-    fn config_loading(&self, _: &dyn ConfigContext, event: &mut ConfigLoadingEvent<'_>) {
-        apply(
-            event.config.mod_id.as_str(),
-            event.config.kind,
-            &event.config.text,
-        );
-    }
-
-    fn config_reloading(&self, _: HostSide, event: &mut ConfigReloadingEvent<'_>) {
-        apply(
-            event.config.mod_id.as_str(),
-            event.config.kind,
-            &event.config.text,
-        );
-    }
-
     /// Manual mode: the table opens for one player at a time.
     fn right_click_block(&self, host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) -> Flow {
         let HostSide::Server(host) = host else {
@@ -181,6 +165,6 @@ impl Hooks for Mod {
         host: &mut dyn ServerHost,
         event: &mut PlayerContainerCloseEvent<'_>,
     ) {
-        table::close(host, event.player, event.pos);
+        table::close(host, event.player.uuid(), event.pos);
     }
 }
