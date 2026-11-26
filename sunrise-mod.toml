@@ -1,7 +1,7 @@
 # Dis-Enchanting Table for Sunrise: the block's content in data/ and assets/, its behaviour in src/.
 id = "disenchanting_table"
 name = "Dis-Enchanting Table"
-version = "5.1.3"
+version = "5.1.4"
 description = "A table that moves an item's enchantments onto a book, or splits an enchanted book in two."
 authors = ["Lupin", "Jason13", "arismoko"]
 license = "Unlicense"
@@ -11,4 +11,4 @@ side = "both"
 
 [native]
 game = "26.3"
-sunrise = "6a02076f89cd189d74d63492dda5b023fa85a38f"
+sunrise = "ba1f24e4ad41246b558230aa665539dc768b1287"
